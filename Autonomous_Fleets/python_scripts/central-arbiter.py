@@ -20,6 +20,14 @@ GRID_DIM_CELLS = 40
 STAGING_X_CM = 50.0
 STAGING_Y_CM = 50.0
 
+# Home position Robot A returns to after grabbing the target
+# Tune to your arena's drop-off zone
+HOME_X_CM = 200.0
+HOME_Y_CM = 50.0
+
+# Seconds to wait after closing gripper before planning the return trip
+GRIPPER_CLOSE_DELAY_S = 1.5
+
 
 # ----------------------------
 # Session state
@@ -55,7 +63,8 @@ next_client_id = 1
 next_robot_path_id = 1000
 
 # Mission state — shared, protected by clients_lock
-mission_state: str = "idle"   # idle | searching | retrieving | complete
+mission_state: str = "idle"   # idle | searching | retrieving | returning | complete
+mission_phase: str = "idle"   # idle | approaching | grabbing | returning | done
 target_position: Optional[dict] = None   # {"x_cm": float, "y_cm": float}
 
 
@@ -533,6 +542,99 @@ def start_coordinated_traverse(message: dict) -> bool:
 # ----------------------------
 # Retrieval mission
 # ----------------------------
+def start_return_trip() -> None:
+    """
+    Called after Robot A closes the gripper on the target.
+    Plans a path from Robot A's current position back to HOME and dispatches it.
+    """
+    global mission_phase
+
+    home_cell = cm_to_cell(HOME_X_CM, HOME_Y_CM)
+
+    with clients_lock:
+        cid = robots_by_id.get("robot_A")
+        session = client_sessions.get(cid) if cid else None
+        if session is None or not session.last_telemetry:
+            print("[MISSION] Cannot plan return trip — no Robot A telemetry")
+            return
+        start = pose_to_cell(session.last_telemetry)
+
+    if start is None:
+        print("[MISSION] Cannot plan return trip — bad telemetry")
+        return
+
+    if start == home_cell:
+        print("[MISSION] Robot A already at home — mission complete")
+        with clients_lock:
+            mission_phase = "done"
+        _complete_mission()
+        return
+
+    path = plan_space_time_path(
+        start=start,
+        goal=home_cell,
+        reservations={},
+        robot_id="robot_A",
+    )
+
+    if path is None:
+        print("[MISSION] Could not plan return path for Robot A")
+        return
+
+    mission_phase = "returning"
+    gui.update_mission_state("returning")
+    print(f"[MISSION] Robot A returning home — {len(path)-1} steps")
+
+    with clients_lock:
+        cid = robots_by_id.get("robot_A")
+        session = client_sessions.get(cid) if cid else None
+        if session is None:
+            return
+        clear_robot_sequence(session)
+        session.pending_waypoints = [cell_center_waypoint(c) for c in path[1:]]
+        session.planned_path_cells = path
+        session.sequence_path_id = next_subpath_id()
+        session.active_subpath_id = None
+        session.awaiting_path_ack = False
+        session.awaiting_path_complete = False
+
+    maybe_dispatch_waiting_sequences()
+
+
+def _complete_mission() -> None:
+    global mission_state, mission_phase
+    with clients_lock:
+        mission_state = "complete"
+        mission_phase = "done"
+    gui.update_mission_state("complete")
+    print("[MISSION] Mission complete — target delivered to home")
+
+
+def on_robot_sequence_complete(robot_id: str) -> None:
+    """
+    Called when a robot has no more pending waypoints (full path sequence done).
+    Drives the retrieval mission state machine forward.
+    """
+    global mission_phase
+
+    if robot_id != "robot_A":
+        return
+
+    with clients_lock:
+        current_phase = mission_phase
+
+    if current_phase == "approaching":
+        print("[MISSION] Robot A reached target — closing gripper")
+        mission_phase = "grabbing"
+        send_to_robot("robot_A", {"type": "toggle_gripper", "robot_id": "robot_A"})
+        threading.Timer(GRIPPER_CLOSE_DELAY_S, start_return_trip).start()
+
+    elif current_phase == "returning":
+        print("[MISSION] Robot A reached home — opening gripper")
+        send_to_robot("robot_A", {"type": "toggle_gripper", "robot_id": "robot_A"})
+        _complete_mission()
+
+
 def start_retrieval_mission(x_cm: float, y_cm: float) -> bool:
     """
     Robot A navigates to the target (the car door).
@@ -540,7 +642,7 @@ def start_retrieval_mission(x_cm: float, y_cm: float) -> bool:
     Both move simultaneously via space-time planning.
     Called by vision pipeline or GUI button.
     """
-    global mission_state, target_position
+    global mission_state, target_position, mission_phase
 
     with clients_lock:
         robot_ids = list(robots_by_id.keys())
@@ -586,6 +688,7 @@ def start_retrieval_mission(x_cm: float, y_cm: float) -> bool:
 
     with clients_lock:
         mission_state = "retrieving"
+        mission_phase = "approaching"
         target_position = {"x_cm": x_cm, "y_cm": y_cm}
 
         for rid, path in paths.items():
@@ -760,7 +863,9 @@ def handle_path_event(client_id: int, msg: dict) -> None:
 
     if msg.get("type") == "path_complete":
         if session.robot_id:
-            dispatch_next_waypoint(session.robot_id)
+            dispatched = dispatch_next_waypoint(session.robot_id)
+            if not dispatched and mission_state == "retrieving":
+                on_robot_sequence_complete(session.robot_id)
         maybe_dispatch_waiting_sequences()
 
 

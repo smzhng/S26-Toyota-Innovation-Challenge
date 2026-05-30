@@ -25,6 +25,7 @@ MISSION_COLORS = {
     "searching":    "#f0a500",
     "target_found": "#2196F3",
     "retrieving":   "#e53935",
+    "returning":    "#9c27b0",
     "complete":     "#43a047",
 }
 
@@ -33,6 +34,7 @@ MISSION_LABELS = {
     "searching":    "Searching for target...",
     "target_found": "Target located! Dispatching robots...",
     "retrieving":   "Retrieving target",
+    "returning":    "Target acquired! Returning to home...",
     "complete":     "Mission complete",
 }
 

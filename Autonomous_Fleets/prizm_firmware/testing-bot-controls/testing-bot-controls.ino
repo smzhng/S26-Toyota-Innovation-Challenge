@@ -38,7 +38,7 @@ void closeGripper() {
 }
 
 void openGripper() {
-  prizm.setServoPosition(1,100);
+  prizm.setServoPosition(1,180);
   //delay(500); 
 } 
 

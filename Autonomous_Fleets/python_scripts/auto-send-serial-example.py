@@ -2,7 +2,7 @@ import serial
 import keyboard
 import time
 
-ser = serial.Serial('COM5', 9600)
+ser = serial.Serial('COM6', 9600)
 
 while True:
     if keyboard.is_pressed('w'):

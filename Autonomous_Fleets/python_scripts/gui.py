@@ -3,7 +3,10 @@ import tkinter as tk
 from tkinter import ttk
 from collections import defaultdict
 import math
+import threading
 import time
+
+import numpy as np
 
 import matplotlib
 matplotlib.use("TkAgg")
@@ -88,6 +91,11 @@ class TelemetryGUI:
         # Planned path overlays: robot_id -> list of (x_cm, y_cm)
         self.planned_paths = {}
 
+        # Occupancy grid map: 40x40 numpy array of probabilities [0..1]
+        # 0.5 = unknown, 0.0 = free, 1.0 = occupied
+        self._occupancy_map: np.ndarray | None = None
+        self._occupancy_lock = threading.Lock()
+
         # Mission state
         self._mission_state = "idle"
         self._target_x_cm = None
@@ -107,6 +115,11 @@ class TelemetryGUI:
     # ----------------------------
     def update_robot(self, robot_id: str, telemetry: dict):
         self.telemetry_queue.put(("telemetry", robot_id, telemetry))
+
+    def update_occupancy_map(self, probability_map: np.ndarray):
+        """Called by arbiter with a fresh 40x40 occupancy probability array."""
+        with self._occupancy_lock:
+            self._occupancy_map = probability_map.copy()
 
     def update_mission_state(self, state: str, target_x_cm: float = None, target_y_cm: float = None):
         """Called by the arbiter when mission state changes."""
@@ -435,13 +448,33 @@ class TelemetryGUI:
         self.ax_traj.set_ylabel("y (cm)")
         self.ax_traj.set_xlim(0, self.ARENA_SIZE_CM)
         self.ax_traj.set_ylim(0, self.ARENA_SIZE_CM)
-        self.ax_traj.set_aspect("equal", adjustable="box")
+        self.ax_traj.set_aspect("equal", adjustable="datalim")
         self.ax_traj.xaxis.set_major_locator(MultipleLocator(50))
         self.ax_traj.yaxis.set_major_locator(MultipleLocator(50))
         self.ax_traj.xaxis.set_minor_locator(MultipleLocator(10))
         self.ax_traj.yaxis.set_minor_locator(MultipleLocator(10))
         self.ax_traj.grid(which="major", linewidth=1.0)
         self.ax_traj.grid(which="minor", linewidth=0.3)
+
+        # ── Occupancy map heatmap ─────────────────────────────────────────
+        # Drawn first so it sits behind everything else.
+        # Cells: 0.0=free(white), 0.5=unknown(grey), 1.0=occupied(dark)
+        with self._occupancy_lock:
+            omap = self._occupancy_map.copy() if self._occupancy_map is not None else None
+
+        if omap is not None:
+            # Flip vertically: row 0 is y=0 (bottom of arena in our coords)
+            display_map = np.flipud(omap)
+            self.ax_traj.imshow(
+                display_map,
+                extent=[0, self.ARENA_SIZE_CM, 0, self.ARENA_SIZE_CM],
+                origin="upper",
+                cmap="RdYlGn_r",   # green=free, yellow=unknown, red=occupied
+                vmin=0.0, vmax=1.0,
+                alpha=0.45,
+                zorder=0,
+                interpolation="nearest",
+            )
 
         # ── Target marker ─────────────────────────────────────────────────
         if self._target_x_cm is not None and self._target_y_cm is not None:

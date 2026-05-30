@@ -69,6 +69,7 @@ FORWARD_TO_ROBOT_TYPES = {
     "resume",
     "stop",
     "toggle_gripper",
+    "set_pose",
 }
 
 serial_write_lock = threading.Lock()
@@ -79,6 +80,7 @@ SERIAL_RETRY_COUNTS = {
     "pause": 5,
     "stop": 5,
     "resume": 3,
+    "path_assignment": 1,  # send once — robot restarts path if it receives duplicates
 }
 SERIAL_RETRY_DELAY_S = 0.03
 

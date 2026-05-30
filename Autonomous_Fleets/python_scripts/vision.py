@@ -1,15 +1,15 @@
 """
-vision.py — Car door target detection for the Autonomous Fleet challenge.
+vision.py — Black pipe detection for the maze mission.
 
 How it works:
   1. Captures frames from a camera (USB webcam or Pi camera)
-  2. Shows live HSV tuning sliders so you can isolate the car door color on the day
+  2. Shows live HSV tuning sliders so you can isolate the black pipe color on the day
   3. When a large enough blob matching the color is detected for N consecutive frames,
-     it calculates the target's arena coordinates using the robot's current odometry
+     it calculates the pipe's arena coordinates using the robot's current odometry
   4. Sends {"type": "target_located", "x_cm": ..., "y_cm": ...} to the arbiter over TCP
-  5. The arbiter automatically kicks off the retrieval mission
+  5. The arbiter plans a maze-avoiding path and sends robot_A to the pipe
 
-Run on the Raspberry Pi (attached to robot A) or your laptop for testing:
+Run on your laptop or Pi:
     python vision.py --env ../robot_a.env
 
 Controls:
@@ -17,6 +17,7 @@ Controls:
     s — save current HSV values to hsv_config.json
     l — load HSV values from hsv_config.json
     t — manually trigger target_located with current detection (for testing)
+    r — reset sent flag so detection fires again
 """
 
 import argparse
@@ -65,11 +66,12 @@ CAMERA_HEIGHT_CM = 20.0
 HSV_CONFIG_FILE = "hsv_config.json"
 
 # Default HSV range — will be overwritten by sliders or loaded config
-# These defaults are for a mid-orange 3D print — adjust on the day
+# These defaults target a black pipe: low saturation, low value.
+# Fine-tune with the sliders on the day (press 's' to save).
 DEFAULT_HSV = {
-    "h_min": 0, "h_max": 180,
-    "s_min": 50, "s_max": 255,
-    "v_min": 50, "v_max": 255,
+    "h_min": 0,  "h_max": 180,
+    "s_min": 0,  "s_max": 80,
+    "v_min": 0,  "v_max": 60,
 }
 
 # ----------------------------
@@ -311,7 +313,7 @@ def main() -> None:
     last_arena_pos = None
 
     print("\n[VISION] Controls: q=quit  s=save HSV  l=load HSV  t=manual trigger  r=reset sent flag")
-    print("[VISION] Tune the sliders until only the car door shows as white in the mask window\n")
+    print("[VISION] Tune the sliders until only the black pipe shows as white in the mask window\n")
 
     while True:
         ret, frame = cap.read()
@@ -382,10 +384,10 @@ def main() -> None:
             )
 
             if confirm_count >= CONFIRM_FRAMES and not target_sent:
-                print(f"[VISION] Target confirmed at arena ({arena_x:.1f}, {arena_y:.1f}) cm")
+                print(f"[VISION] Pipe confirmed at arena ({arena_x:.1f}, {arena_y:.1f}) cm")
                 send_target_located(arena_x, arena_y)
                 cv2.putText(
-                    display, "TARGET SENT",
+                    display, "PIPE LOCATED — SENT",
                     (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3,
                 )
         else:
@@ -393,7 +395,7 @@ def main() -> None:
 
         # Status overlay
         sent_color = (0, 255, 0) if target_sent else (0, 165, 255)
-        sent_text = "MISSION TRIGGERED" if target_sent else "searching..."
+        sent_text = "PIPE SENT — ROBOT NAVIGATING" if target_sent else "searching for black pipe..."
         cv2.putText(display, sent_text, (10, frame_h - 15),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, sent_color, 2)
 

@@ -11,7 +11,7 @@ matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib.ticker import MultipleLocator
-from matplotlib.patches import Polygon, FancyArrowPatch
+from matplotlib.patches import Polygon, FancyArrowPatch, Circle, Rectangle
 from itertools import cycle
 from messages import (
     PauseMessage, ResumeMessage, StopMessage, ToggleGripperMessage,
@@ -30,10 +30,10 @@ MISSION_COLORS = {
 
 MISSION_LABELS = {
     "idle":         "Idle — waiting for mission",
-    "searching":    "Searching for target...",
-    "target_found": "Target located! Dispatching robots...",
-    "retrieving":   "Retrieving target",
-    "complete":     "Mission complete",
+    "searching":    "Searching for pipe...",
+    "target_found": "Pipe located! Planning maze route...",
+    "retrieving":   "Navigating to pipe",
+    "complete":     "Pipe reached — mission complete",
 }
 
 
@@ -92,6 +92,10 @@ class TelemetryGUI:
         self._mission_state = "idle"
         self._target_x_cm = None
         self._target_y_cm = None
+
+        # Maze walls: set of (row, col) grid cells marked as cardboard walls
+        self.wall_cells: set[tuple[int, int]] = set()
+        self._wall_edit_mode = False
 
         self.robot_colors = {}
         self.color_cycle = cycle([
@@ -166,6 +170,16 @@ class TelemetryGUI:
             textvariable=self._target_coords_var,
             font=("Helvetica", 9),
             justify=tk.LEFT,
+        ).pack(fill=tk.X, padx=6, pady=(0, 2))
+
+        self._path_info_var = tk.StringVar(value="")
+        tk.Label(
+            mission_frame,
+            textvariable=self._path_info_var,
+            font=("Helvetica", 8),
+            fg="#555555",
+            justify=tk.LEFT,
+            wraplength=280,
         ).pack(fill=tk.X, padx=6, pady=(0, 6))
 
         # ── Robot table ───────────────────────────────────────────────────
@@ -191,6 +205,7 @@ class TelemetryGUI:
         self.ax_traj = self.fig.add_subplot(111)
         self.canvas_plot = FigureCanvasTkAgg(self.fig, master=right_panel)
         self.canvas_plot.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.canvas_plot.mpl_connect("button_press_event", self._on_plot_click)
 
         # ── Manual controls ───────────────────────────────────────────────
         controls_frame = ttk.LabelFrame(scrollable_frame, text="Robot Controls")
@@ -219,13 +234,12 @@ class TelemetryGUI:
         ]:
             ttk.Button(controls_frame, text=label, command=cmd).pack(fill=tk.X, pady=2)
 
-        # ── Retrieval mission panel ───────────────────────────────────────
-        mission_ctrl_frame = ttk.LabelFrame(scrollable_frame, text="Retrieval Mission")
+        # ── Pipe mission panel ────────────────────────────────────────────
+        mission_ctrl_frame = ttk.LabelFrame(scrollable_frame, text="Pipe Mission")
         mission_ctrl_frame.pack(fill=tk.X, expand=False, padx=(0, 8), pady=(8, 0))
 
         ttk.Label(mission_ctrl_frame,
-                  text="Manually set target position and launch mission.\n"
-                       "Vision will override these when it detects the door.",
+                  text="Enter pipe coordinates, or vision.py will fill these automatically.",
                   wraplength=280, justify=tk.LEFT).pack(fill=tk.X, padx=4, pady=(4, 6))
 
         coord_row = ttk.Frame(mission_ctrl_frame)
@@ -238,7 +252,7 @@ class TelemetryGUI:
         ttk.Entry(coord_row, textvariable=self.mission_y_var, width=7).grid(row=0, column=3, padx=(4, 0))
 
         ttk.Button(
-            mission_ctrl_frame, text="Start Retrieval Mission",
+            mission_ctrl_frame, text="Send Robot to Pipe",
             command=self._send_retrieval_mission,
         ).pack(fill=tk.X, padx=4, pady=(0, 4))
 
@@ -247,37 +261,46 @@ class TelemetryGUI:
             command=self._reset_mission,
         ).pack(fill=tk.X, padx=4, pady=(0, 6))
 
-        # ── Coordinated traverse panel ────────────────────────────────────
-        coord_frame = ttk.LabelFrame(scrollable_frame, text="Grid Coordination")
-        coord_frame.pack(fill=tk.X, expand=False, padx=(0, 8), pady=(8, 0))
+        # ── Starting pose panel ───────────────────────────────────────────
+        pose_frame = ttk.LabelFrame(scrollable_frame, text="Robot Starting Pose")
+        pose_frame.pack(fill=tk.X, expand=False, padx=(0, 8), pady=(8, 0))
 
-        ttk.Label(coord_frame,
-                  text="40×40 grid at 10 cm resolution.",
-                  wraplength=280, justify=tk.LEFT).pack(fill=tk.X, pady=(4, 6))
+        ttk.Label(pose_frame,
+                  text="Set where the robot is physically placed before starting. "
+                       "Default is (200, 100) facing 90°.",
+                  wraplength=280, justify=tk.LEFT).pack(fill=tk.X, padx=4, pady=(4, 6))
 
-        for label, robot_var_name, row_var_name, col_var_name, row_default, col_default in [
-            ("Robot 1", "grid_robot_one_var", "grid_robot_one_row_var", "grid_robot_one_col_var", "10", "10"),
-            ("Robot 2", "grid_robot_two_var", "grid_robot_two_row_var", "grid_robot_two_col_var", "20", "20"),
-        ]:
-            ttk.Label(coord_frame, text=label).pack(fill=tk.X)
-            setattr(self, robot_var_name, tk.StringVar(value=""))
-            combo = ttk.Combobox(coord_frame, textvariable=getattr(self, robot_var_name),
-                                 state="readonly", values=[])
-            combo.pack(fill=tk.X, pady=(0, 4))
-            goal_row = ttk.Frame(coord_frame)
-            goal_row.pack(fill=tk.X, pady=(0, 6))
-            ttk.Label(goal_row, text="Goal row").grid(row=0, column=0, sticky="w")
-            setattr(self, row_var_name, tk.StringVar(value=row_default))
-            ttk.Entry(goal_row, textvariable=getattr(self, row_var_name), width=6).grid(row=0, column=1, padx=(4, 12))
-            ttk.Label(goal_row, text="Goal col").grid(row=0, column=2, sticky="w")
-            setattr(self, col_var_name, tk.StringVar(value=col_default))
-            ttk.Entry(goal_row, textvariable=getattr(self, col_var_name), width=6).grid(row=0, column=3, padx=(4, 0))
+        pose_row = ttk.Frame(pose_frame)
+        pose_row.pack(fill=tk.X, padx=4, pady=(0, 4))
+        ttk.Label(pose_row, text="X").grid(row=0, column=0, sticky="w")
+        self.pose_x_var = tk.StringVar(value="200")
+        ttk.Entry(pose_row, textvariable=self.pose_x_var, width=5).grid(row=0, column=1, padx=(2, 8))
+        ttk.Label(pose_row, text="Y").grid(row=0, column=2, sticky="w")
+        self.pose_y_var = tk.StringVar(value="100")
+        ttk.Entry(pose_row, textvariable=self.pose_y_var, width=5).grid(row=0, column=3, padx=(2, 8))
+        ttk.Label(pose_row, text="θ°").grid(row=0, column=4, sticky="w")
+        self.pose_theta_var = tk.StringVar(value="90")
+        ttk.Entry(pose_row, textvariable=self.pose_theta_var, width=5).grid(row=0, column=5, padx=(2, 0))
 
-        self.grid_plan_summary_var = tk.StringVar(value="Select two robots and set destination cells (0–39).")
-        ttk.Label(coord_frame, textvariable=self.grid_plan_summary_var,
-                  wraplength=280, justify=tk.LEFT).pack(fill=tk.X, pady=(0, 6))
-        ttk.Button(coord_frame, text="Start Two-Robot Traverse",
-                   command=self._send_two_robot_traverse).pack(fill=tk.X, pady=2)
+        ttk.Button(pose_frame, text="Set Robot Start Pose",
+                   command=self._send_set_pose).pack(fill=tk.X, padx=4, pady=(0, 6))
+
+        # ── Maze walls panel ──────────────────────────────────────────────
+        walls_frame = ttk.LabelFrame(scrollable_frame, text="Maze Walls")
+        walls_frame.pack(fill=tk.X, expand=False, padx=(0, 8), pady=(8, 0))
+
+        ttk.Label(walls_frame,
+                  text="Click grid cells on the arena plot to mark/unmark cardboard walls. "
+                       "The A* planner will route around them.",
+                  wraplength=280, justify=tk.LEFT).pack(fill=tk.X, padx=4, pady=(4, 6))
+
+        self._wall_edit_var = tk.StringVar(value="Edit Walls: OFF")
+        self._wall_edit_btn = ttk.Button(walls_frame, textvariable=self._wall_edit_var,
+                                         command=self._toggle_wall_edit)
+        self._wall_edit_btn.pack(fill=tk.X, padx=4, pady=2)
+
+        ttk.Button(walls_frame, text="Clear All Walls",
+                   command=self._clear_walls).pack(fill=tk.X, padx=4, pady=(2, 6))
 
     # ----------------------------
     # Helpers
@@ -454,7 +477,7 @@ class TelemetryGUI:
                               label="Target (car door)")
 
             # Dashed circle around target
-            circle = plt_circle = __import__("matplotlib.patches", fromlist=["Circle"]).Circle(
+            circle = Circle(
                 (tx, ty), 15, fill=False, linestyle="--",
                 edgecolor=color, linewidth=1.5, alpha=0.7, zorder=9,
             )
@@ -467,13 +490,20 @@ class TelemetryGUI:
                 arrowprops=dict(arrowstyle="->", color=color, lw=1.0),
             )
 
-        # ── Staging position marker ───────────────────────────────────────
-        # Import here to keep top-level clean
-        staging_x = 50.0
-        staging_y = 50.0
-        self.ax_traj.plot(staging_x, staging_y, "s",
-                          color="tab:gray", markersize=10, alpha=0.5,
-                          label="Robot B staging", zorder=5)
+        # ── Maze wall cells ───────────────────────────────────────────────
+        for (row, col) in self.wall_cells:
+            x0 = col * self.GRID_SPACING_CM
+            y0 = row * self.GRID_SPACING_CM
+            self.ax_traj.add_patch(Rectangle(
+                (x0, y0), self.GRID_SPACING_CM, self.GRID_SPACING_CM,
+                facecolor="#444444", edgecolor="#222222", alpha=0.75, zorder=3,
+            ))
+
+        if self._wall_edit_mode:
+            self.ax_traj.set_title(
+                "Fleet Arena — WALL EDIT MODE (click cells to toggle)",
+                fontsize=12, color="#e53935",
+            )
 
         # ── Planned path overlays ─────────────────────────────────────────
         for robot_id, path_waypoints in self.planned_paths.items():
@@ -580,19 +610,9 @@ class TelemetryGUI:
 
     def _refresh_robot_selector(self):
         robot_ids = sorted(self.robot_states.keys())
-        for combo_var, combo_name in [
-            (self.selected_robot_var,  "robot_selector"),
-            (self.grid_robot_one_var,  "grid_robot_one_selector"),
-            (self.grid_robot_two_var,  "grid_robot_two_selector"),
-        ]:
-            widget = getattr(self, combo_name, None)
-            if widget:
-                widget["values"] = robot_ids
-            if combo_var.get() not in robot_ids and robot_ids:
-                combo_var.set(robot_ids[0])
-
-        if not self.grid_robot_two_var.get() and len(robot_ids) > 1:
-            self.grid_robot_two_var.set(robot_ids[1])
+        self.robot_selector["values"] = robot_ids
+        if self.selected_robot_var.get() not in robot_ids and robot_ids:
+            self.selected_robot_var.set(robot_ids[0])
 
         selected_state = self.robot_states.get(self.selected_robot_var.get())
         if selected_state:
@@ -712,6 +732,7 @@ class TelemetryGUI:
         self._mission_status_var.set(MISSION_LABELS["retrieving"])
         self._mission_status_label.config(fg=MISSION_COLORS["retrieving"])
         self._target_coords_var.set(f"Target: ({x_cm:.0f}, {y_cm:.0f}) cm")
+        self._path_info_var.set("Planning path — check arbiter terminal for details")
 
         self.command_sender({
             "type": "retrieval_mission",
@@ -727,43 +748,59 @@ class TelemetryGUI:
         self._mission_status_var.set(MISSION_LABELS["idle"])
         self._mission_status_label.config(fg=MISSION_COLORS["idle"])
         self._target_coords_var.set("Target: not yet detected")
+        self._path_info_var.set("")
 
-    def _parse_goal_cell(self, row_var, col_var):
+    def _send_set_pose(self):
+        rid = self._get_selected_robot_id()
+        if not rid or not self.command_sender:
+            return
         try:
-            row = int(row_var.get())
-            col = int(col_var.get())
-        except (TypeError, ValueError):
-            return None
-        if not (0 <= row < self.GRID_DIM_CELLS and 0 <= col < self.GRID_DIM_CELLS):
-            return None
-        return row, col
-
-    def _send_two_robot_traverse(self):
-        if not self.command_sender:
+            x = float(self.pose_x_var.get())
+            y = float(self.pose_y_var.get())
+            theta = float(self.pose_theta_var.get())
+        except ValueError:
             return
-        r1 = self.grid_robot_one_var.get().strip()
-        r2 = self.grid_robot_two_var.get().strip()
-        if not r1 or not r2 or r1 == r2:
-            self.grid_plan_summary_var.set("Pick two different robots.")
-            return
-        g1 = self._parse_goal_cell(self.grid_robot_one_row_var, self.grid_robot_one_col_var)
-        g2 = self._parse_goal_cell(self.grid_robot_two_row_var, self.grid_robot_two_col_var)
-        if g1 is None or g2 is None:
-            self.grid_plan_summary_var.set("Goal cells must be integers 0–39.")
-            return
-        if g1 == g2:
-            self.grid_plan_summary_var.set("Choose different goal cells.")
-            return
-        self.grid_plan_summary_var.set(
-            f"Planning: {r1}→({g1[0]},{g1[1]}), {r2}→({g2[0]},{g2[1]})"
-        )
         self.command_sender({
-            "type": "coordinated_traverse",
-            "robots": [
-                {"robot_id": r1, "goal_row": g1[0], "goal_col": g1[1]},
-                {"robot_id": r2, "goal_row": g2[0], "goal_col": g2[1]},
-            ],
+            "type": "set_pose",
+            "robot_id": rid,
+            "x_cm": x,
+            "y_cm": y,
+            "theta_deg": theta,
         })
+
+    # ----------------------------
+    # Wall editing
+    # ----------------------------
+    def _toggle_wall_edit(self):
+        self._wall_edit_mode = not self._wall_edit_mode
+        self._wall_edit_var.set(f"Edit Walls: {'ON  (click arena cells)' if self._wall_edit_mode else 'OFF'}")
+        self._refresh_plot()
+
+    def _clear_walls(self):
+        self.wall_cells.clear()
+        self._send_wall_update()
+        self._refresh_plot()
+
+    def _send_wall_update(self):
+        if self.command_sender:
+            self.command_sender({
+                "type": "set_walls",
+                "wall_cells": list(self.wall_cells),
+            })
+
+    def _on_plot_click(self, event):
+        if not self._wall_edit_mode or event.inaxes != self.ax_traj:
+            return
+        col = int(event.xdata // self.GRID_SPACING_CM)
+        row = int(event.ydata // self.GRID_SPACING_CM)
+        if 0 <= row < self.GRID_DIM_CELLS and 0 <= col < self.GRID_DIM_CELLS:
+            cell = (row, col)
+            if cell in self.wall_cells:
+                self.wall_cells.discard(cell)
+            else:
+                self.wall_cells.add(cell)
+            self._send_wall_update()
+            self._refresh_plot()
 
     def run(self):
         self.root.mainloop()

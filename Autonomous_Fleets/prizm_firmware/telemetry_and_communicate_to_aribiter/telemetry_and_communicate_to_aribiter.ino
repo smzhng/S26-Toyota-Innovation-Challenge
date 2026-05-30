@@ -682,6 +682,26 @@ void handleToggleGripper(const char *json)
   performToggleGripper();
 }
 
+void handleSetPose(const char *json)
+{
+  if (!jsonTargetsThisRobot(json))
+    return;
+
+  float newX = x_cm, newY = y_cm;
+  float newThetaDeg = radToDeg(theta_rad);
+  extractFloatField(json, "x_cm", newX);
+  extractFloatField(json, "y_cm", newY);
+  extractFloatField(json, "theta_deg", newThetaDeg);
+
+  x_cm = newX;
+  y_cm = newY;
+  theta_rad = degToRad(newThetaDeg);
+  resetEncoderTracking();
+
+  sendAck("set_pose");
+  printPoseJSON();
+}
+
 void handleControlOpcode(char opcode)
 {
   if (opcode == 'P')
@@ -719,6 +739,10 @@ void handleIncomingJson(const char *json)
   else if (jsonHasType(json, "toggle_gripper"))
   {
     handleToggleGripper(json);
+  }
+  else if (jsonHasType(json, "set_pose"))
+  {
+    handleSetPose(json);
   }
 }
 

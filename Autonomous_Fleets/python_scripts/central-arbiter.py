@@ -15,11 +15,6 @@ MAX_CLIENTS = 10
 GRID_CELL_CM = 10.0
 GRID_DIM_CELLS = 40
 
-# Staging position for robot B during retrieval missions (centre of arena, near edge)
-# Tune this to a safe corner of your physical arena
-STAGING_X_CM = 50.0
-STAGING_Y_CM = 50.0
-
 
 # ----------------------------
 # Session state
@@ -57,6 +52,10 @@ next_robot_path_id = 1000
 # Mission state — shared, protected by clients_lock
 mission_state: str = "idle"   # idle | searching | retrieving | complete
 target_position: Optional[dict] = None   # {"x_cm": float, "y_cm": float}
+
+# Maze walls — set of (row, col) grid cells the planner cannot enter
+# Updated live from the GUI; no lock needed (GIL protects simple set replacement)
+wall_cells: set[tuple[int, int]] = set()
 
 
 # ----------------------------
@@ -258,6 +257,10 @@ def plan_space_time_path(
             if not (0 <= nr < GRID_DIM_CELLS and 0 <= nc < GRID_DIM_CELLS):
                 continue
 
+            # Block cardboard wall cells
+            if (nr, nc) in wall_cells:
+                continue
+
             next_state = (nr, nc, next_t)
 
             # Cell-time collision: another robot reserved this cell at next_t
@@ -299,51 +302,11 @@ def reserve_path(
             reservations[(goal[0], goal[1], last_t + extra)] = robot_id
 
 
-def plan_paths_simultaneous(
-    starts: dict,   # robot_id -> (row, col)
-    goals: dict,    # robot_id -> (row, col)
-) -> dict | None:
-    """
-    Plan collision-free paths for all robots simultaneously using
-    space-time A* with a shared reservation table.
-
-    Returns dict of robot_id -> list[(row, col)], or None if any robot
-    cannot find a path.
-    """
-    reservations = {}
-    paths = {}
-
-    # Plan robots in order of path length (shorter paths first reduces conflicts)
-    robot_ids = list(starts.keys())
-    robot_ids.sort(key=lambda r: heuristic(starts[r], goals[r]))
-
-    for robot_id in robot_ids:
-        path = plan_space_time_path(
-            start=starts[robot_id],
-            goal=goals[robot_id],
-            reservations=reservations,
-            robot_id=robot_id,
-        )
-        if path is None:
-            print(f"[PLANNER] No space-time path found for {robot_id}")
-            return None
-
-        reserve_path(path, robot_id, reservations)
-        paths[robot_id] = path
-        print(f"[PLANNER] {robot_id}: {starts[robot_id]} -> {goals[robot_id]}, {len(path)-1} steps")
-
-    return paths
-
-
 # ----------------------------
 # Waypoint dispatch
 # ----------------------------
 def dispatch_next_waypoint(robot_id: str) -> bool:
-    """
-    Pop the next pending waypoint for this robot and send it.
-    No longer checks whether other robots are busy — simultaneous movement
-    is now handled by the space-time planner at planning time.
-    """
+    """Pop the next pending waypoint for this robot and send it."""
     with clients_lock:
         client_id = robots_by_id.get(robot_id)
         if client_id is None:
@@ -397,10 +360,7 @@ def dispatch_next_waypoint(robot_id: str) -> bool:
 
 
 def maybe_dispatch_waiting_sequences() -> None:
-    """
-    Dispatch the next waypoint for EVERY robot that has pending work
-    and is not currently executing. Robots now move in parallel.
-    """
+    """Dispatch the next waypoint for any robot that has pending work and is idle."""
     with clients_lock:
         robot_ids = [
             session.robot_id
@@ -452,158 +412,70 @@ def queue_robot_path(message: dict) -> bool:
 
 
 # ----------------------------
-# Coordinated traverse (upgraded)
-# ----------------------------
-def start_coordinated_traverse(message: dict) -> bool:
-    """
-    Two-robot coordinated traverse using space-time A*.
-    Both robots plan and move simultaneously — no turn-taking.
-    """
-    robots = message.get("robots", [])
-    if len(robots) != 2:
-        print("[COORD] Expected exactly two robots")
-        return False
-
-    robot_one_id = str(robots[0].get("robot_id", "")).strip()
-    robot_two_id = str(robots[1].get("robot_id", "")).strip()
-
-    if not robot_one_id or not robot_two_id or robot_one_id == robot_two_id:
-        print("[COORD] Need two distinct robot IDs")
-        return False
-
-    with clients_lock:
-        s1 = client_sessions.get(robots_by_id.get(robot_one_id))
-        s2 = client_sessions.get(robots_by_id.get(robot_two_id))
-
-        if s1 is None or s2 is None:
-            print("[COORD] One or both robots not connected")
-            return False
-
-        start_one = pose_to_cell(s1.last_telemetry or {})
-        start_two = pose_to_cell(s2.last_telemetry or {})
-        if start_one is None or start_two is None:
-            print("[COORD] Need telemetry from both robots before planning")
-            return False
-
-        goal_one = (clamp_cell(int(robots[0]["goal_row"])), clamp_cell(int(robots[0]["goal_col"])))
-        goal_two = (clamp_cell(int(robots[1]["goal_row"])), clamp_cell(int(robots[1]["goal_col"])))
-
-        if start_one == start_two:
-            print("[COORD] Robots in same cell — separate them first")
-            return False
-        if goal_one == goal_two:
-            print("[COORD] Robots cannot share a goal cell")
-            return False
-
-        clear_robot_sequence(s1)
-        clear_robot_sequence(s2)
-
-    paths = plan_paths_simultaneous(
-        starts={robot_one_id: start_one, robot_two_id: start_two},
-        goals={robot_one_id: goal_one, robot_two_id: goal_two},
-    )
-
-    if paths is None:
-        print("[COORD] Space-time planner failed to find collision-free paths")
-        return False
-
-    with clients_lock:
-        s1 = client_sessions[robots_by_id[robot_one_id]]
-        s2 = client_sessions[robots_by_id[robot_two_id]]
-
-        s1.pending_waypoints = [cell_center_waypoint(c) for c in paths[robot_one_id][1:]]
-        s1.planned_path_cells = paths[robot_one_id]
-        s1.sequence_path_id = next_subpath_id()
-        s1.active_subpath_id = None
-        s1.awaiting_path_ack = False
-        s1.awaiting_path_complete = False
-
-        s2.pending_waypoints = [cell_center_waypoint(c) for c in paths[robot_two_id][1:]]
-        s2.planned_path_cells = paths[robot_two_id]
-        s2.sequence_path_id = next_subpath_id()
-        s2.active_subpath_id = None
-        s2.awaiting_path_ack = False
-        s2.awaiting_path_complete = False
-
-    # Dispatch both robots simultaneously
-    maybe_dispatch_waiting_sequences()
-    return True
-
-
-# ----------------------------
-# Retrieval mission
+# Pipe mission
 # ----------------------------
 def start_retrieval_mission(x_cm: float, y_cm: float) -> bool:
     """
-    Robot A navigates to the target (the car door).
-    Robot B moves to a staging position out of the way.
-    Both move simultaneously via space-time planning.
-    Called by vision pipeline or GUI button.
+    Plan a wall-avoiding A* path and send robot_A to the black pipe.
+    Called by vision pipeline or the GUI "Send to Pipe" button.
     """
     global mission_state, target_position
 
-    with clients_lock:
-        robot_ids = list(robots_by_id.keys())
-
-    if len(robot_ids) < 1:
-        print("[MISSION] No robots connected")
-        return False
-
     robot_a_id = "robot_A"
-    robot_b_id = "robot_B"
 
     with clients_lock:
         s_a = client_sessions.get(robots_by_id.get(robot_a_id))
-        s_b = client_sessions.get(robots_by_id.get(robot_b_id))
+
+    if s_a is None or not s_a.last_telemetry:
+        print("[MISSION] robot_A not connected or no telemetry yet")
+        return False
+
+    start_cell = pose_to_cell(s_a.last_telemetry)
+    if start_cell is None:
+        print("[MISSION] Cannot determine robot_A position from telemetry")
+        return False
 
     target_cell = cm_to_cell(x_cm, y_cm)
-    staging_cell = cm_to_cell(STAGING_X_CM, STAGING_Y_CM)
+    print(f"[MISSION] Planning: robot at cell {start_cell} "
+          f"({s_a.last_telemetry.get('x_cm','?'):.1f}, {s_a.last_telemetry.get('y_cm','?'):.1f}) cm "
+          f"-> pipe cell {target_cell} ({x_cm:.0f}, {y_cm:.0f}) cm  walls={len(wall_cells)}")
 
-    starts = {}
-    goals = {}
+    path = plan_space_time_path(
+        start=start_cell,
+        goal=target_cell,
+        reservations={},
+        robot_id=robot_a_id,
+    )
 
-    if s_a and s_a.last_telemetry:
-        start_a = pose_to_cell(s_a.last_telemetry)
-        if start_a:
-            starts[robot_a_id] = start_a
-            goals[robot_a_id] = target_cell
-
-    if s_b and s_b.last_telemetry:
-        start_b = pose_to_cell(s_b.last_telemetry)
-        if start_b and start_b != staging_cell:
-            starts[robot_b_id] = start_b
-            goals[robot_b_id] = staging_cell
-
-    if not starts:
-        print("[MISSION] No robot telemetry available to plan from")
+    if path is None:
+        print("[MISSION] A* could not find a path — check that walls don't block all routes")
         return False
 
-    paths = plan_paths_simultaneous(starts=starts, goals=goals)
-
-    if paths is None:
-        print("[MISSION] Planner could not find collision-free paths for mission")
-        return False
+    waypoints = [cell_center_waypoint(c) for c in path[1:]]
+    print(f"[MISSION] Path found: {len(path)-1} steps")
+    for i, wp in enumerate(waypoints):
+        print(f"  waypoint {i+1}: ({wp['x_cm']:.0f}, {wp['y_cm']:.0f}) cm")
+    if not waypoints:
+        print("[MISSION] WARNING: path is 0 steps — robot is already in the target cell")
 
     with clients_lock:
         mission_state = "retrieving"
         target_position = {"x_cm": x_cm, "y_cm": y_cm}
+        cid = robots_by_id.get(robot_a_id)
+        session = client_sessions.get(cid) if cid else None
+        if session is None:
+            return False
+        clear_robot_sequence(session)
+        session.pending_waypoints = waypoints
+        session.planned_path_cells = path
+        session.sequence_path_id = next_subpath_id()
+        session.active_subpath_id = None
+        session.awaiting_path_ack = False
+        session.awaiting_path_complete = False
 
-        for rid, path in paths.items():
-            cid = robots_by_id.get(rid)
-            session = client_sessions.get(cid) if cid else None
-            if session is None:
-                continue
-            clear_robot_sequence(session)
-            session.pending_waypoints = [cell_center_waypoint(c) for c in path[1:]]
-            session.planned_path_cells = path
-            session.sequence_path_id = next_subpath_id()
-            session.active_subpath_id = None
-            session.awaiting_path_ack = False
-            session.awaiting_path_complete = False
-
-    print(f"[MISSION] Retrieval mission started — target ({x_cm:.0f}, {y_cm:.0f}) cm")
+    print(f"[MISSION] Dispatching first waypoint to robot_A")
     gui.update_mission_state("retrieving", x_cm, y_cm)
-    maybe_dispatch_waiting_sequences()
+    dispatch_next_waypoint(robot_a_id)
     return True
 
 
@@ -615,9 +487,10 @@ def gui_command_sender(message_obj) -> None:
         message = message_obj if isinstance(message_obj, dict) else message_obj.to_dict()
         robot_id = message.get("robot_id")
 
-        if message.get("type") == "coordinated_traverse":
-            ok = start_coordinated_traverse(message)
-            print("[GUI SEND] Coordinated traverse", "started" if ok else "FAILED")
+        if message.get("type") == "set_walls":
+            global wall_cells
+            wall_cells = {tuple(c) for c in message.get("wall_cells", [])}
+            print(f"[GUI] Maze walls updated: {len(wall_cells)} blocked cells")
             return
 
         if message.get("type") == "retrieval_mission":
@@ -625,7 +498,7 @@ def gui_command_sender(message_obj) -> None:
                 float(message.get("x_cm", 200)),
                 float(message.get("y_cm", 200)),
             )
-            print("[GUI SEND] Retrieval mission", "started" if ok else "FAILED")
+            print("[GUI SEND] Pipe mission", "started" if ok else "FAILED")
             return
 
         if not robot_id:
@@ -794,11 +667,8 @@ def handle_heartbeat(client_id: int, conn: socket.socket, msg: dict) -> None:
 
 
 def handle_target_located(msg: dict) -> None:
-    """
-    Called when vision.py sends a target_located message.
-    Automatically kicks off the retrieval mission.
-    """
-    global mission_state, target_position
+    """Called when vision.py confirms the black pipe location."""
+    global mission_state
 
     x_cm = msg.get("x_cm")
     y_cm = msg.get("y_cm")
@@ -807,11 +677,11 @@ def handle_target_located(msg: dict) -> None:
         print("[VISION] target_located missing coordinates")
         return
 
-    print(f"[VISION] Target located at ({x_cm:.1f}, {y_cm:.1f}) cm — starting retrieval mission")
+    print(f"[VISION] Pipe located at ({x_cm:.1f}, {y_cm:.1f}) cm — planning maze route")
 
     with clients_lock:
         if mission_state == "retrieving":
-            print("[VISION] Mission already in progress — ignoring duplicate target_located")
+            print("[VISION] Mission already in progress — ignoring duplicate")
             return
         mission_state = "searching"
 

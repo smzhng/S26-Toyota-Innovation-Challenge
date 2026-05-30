@@ -11,10 +11,30 @@ matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib.ticker import MultipleLocator
-from matplotlib.patches import Polygon
+from matplotlib.patches import Polygon, FancyArrowPatch
 from itertools import cycle
-from messages import PauseMessage, ResumeMessage, StopMessage, ToggleGripperMessage, PathAssignmentMessage, Waypoint, MotionSettings
+from messages import (
+    PauseMessage, ResumeMessage, StopMessage, ToggleGripperMessage,
+    PathAssignmentMessage, Waypoint, MotionSettings,
+)
 
+
+# Mission state colours
+MISSION_COLORS = {
+    "idle":         "#888888",
+    "searching":    "#f0a500",
+    "target_found": "#2196F3",
+    "retrieving":   "#e53935",
+    "complete":     "#43a047",
+}
+
+MISSION_LABELS = {
+    "idle":         "Idle — waiting for mission",
+    "searching":    "Searching for target...",
+    "target_found": "Target located! Dispatching robots...",
+    "retrieving":   "Retrieving target",
+    "complete":     "Mission complete",
+}
 
 
 class TelemetryGUI:
@@ -23,11 +43,9 @@ class TelemetryGUI:
 
     Server threads call:
         gui.update_robot(robot_id, telemetry_dict)
-
-    GUI runs on main thread and consumes queued updates.
+        gui.update_mission_state(state, target_x_cm, target_y_cm)
     """
 
-    # Sensor geometry
     MAX_VALID_ULTRASONIC_CM = 200.0
     MIN_VALID_ULTRASONIC_CM = 1.0
 
@@ -39,60 +57,46 @@ class TelemetryGUI:
     LEFT_SENSOR_LATERAL_OFFSET_CM = 16.0
     LEFT_SENSOR_ANGLE_OFFSET_DEG = 90.0
 
-    # Arena display settings: fixed 4m x 4m = 400cm x 400cm
     ARENA_SIZE_CM = 400
-    HALF_ARENA_CM = ARENA_SIZE_CM / 2
     GRID_SPACING_CM = 10
     ECHO_WINDOW_S = 10.0
     GRID_DIM_CELLS = 40
     DEFAULT_TEST_DISTANCE_CM = 30.0
     DEFAULT_TURN_SPEED = 150
     DEFAULT_DRIVE_SPEED = 200
-
-    # Robot safety box
     SAFETY_BOX_SIZE_CM = 40.0
     SAFETY_BOX_HALF_CM = SAFETY_BOX_SIZE_CM / 2.0
 
     def __init__(self, command_sender=None):
         self.root = tk.Tk()
-        self.root.title("Robot Telemetry Dashboard")
+        self.root.title("Fleet Mission Dashboard")
         self.root.geometry("1600x900")
 
         self.command_sender = command_sender
         self.telemetry_queue = queue.Queue()
+        self.mission_queue = queue.Queue()
         self.test_path_counter = int(time.time())
 
-        # latest per-robot state
         self.robot_states = {}
-
-        # per-robot history
         self.robot_history = defaultdict(lambda: {
-            "t": [],
-            "x": [],
-            "y": [],
-            "theta": [],
-            "front_ultra": [],
-            "left_ultra": [],
-            "front_echo_t": [],
-            "front_echo_x": [],
-            "front_echo_y": [],
-            "left_echo_t": [],
-            "left_echo_x": [],
-            "left_echo_y": [],
+            "t": [], "x": [], "y": [], "theta": [],
+            "front_ultra": [], "left_ultra": [],
+            "front_echo_t": [], "front_echo_x": [], "front_echo_y": [],
+            "left_echo_t": [], "left_echo_x": [], "left_echo_y": [],
         })
+
+        # Planned path overlays: robot_id -> list of (x_cm, y_cm)
+        self.planned_paths = {}
+
+        # Mission state
+        self._mission_state = "idle"
+        self._target_x_cm = None
+        self._target_y_cm = None
 
         self.robot_colors = {}
         self.color_cycle = cycle([
-            "tab:blue",
-            "tab:orange",
-            "tab:green",
-            "tab:red",
-            "tab:purple",
-            "tab:brown",
-            "tab:pink",
-            "tab:gray",
-            "tab:olive",
-            "tab:cyan",
+            "tab:blue", "tab:orange", "tab:green", "tab:red",
+            "tab:purple", "tab:brown", "tab:pink", "tab:cyan",
         ])
 
         self._build_layout()
@@ -102,284 +106,311 @@ class TelemetryGUI:
     # Public API
     # ----------------------------
     def update_robot(self, robot_id: str, telemetry: dict):
-        self.telemetry_queue.put((robot_id, telemetry))
+        self.telemetry_queue.put(("telemetry", robot_id, telemetry))
 
-    def run(self):
-        self.root.mainloop()
+    def update_mission_state(self, state: str, target_x_cm: float = None, target_y_cm: float = None):
+        """Called by the arbiter when mission state changes."""
+        self.mission_queue.put((state, target_x_cm, target_y_cm))
+
+    def update_planned_path(self, robot_id: str, path_cells: list):
+        """Called by arbiter to push a planned path for overlay drawing."""
+        waypoints = [
+            (col * 10 + 5, row * 10 + 5)
+            for row, col in path_cells
+        ]
+        self.telemetry_queue.put(("path_overlay", robot_id, waypoints))
 
     # ----------------------------
     # Layout
     # ----------------------------
-    
-    def _build_layout(self): 
+    def _build_layout(self):
         mainframe = ttk.Frame(self.root, padding=8)
         mainframe.pack(fill=tk.BOTH, expand=True)
 
-        # Left panel: compact robot table
+        # Left panel
         left_panel = ttk.Frame(mainframe, width=320)
         left_panel.pack(side=tk.LEFT, fill=tk.Y, expand=False)
         left_panel.pack_propagate(False)
 
         canvas = tk.Canvas(left_panel)
         scrollbar = ttk.Scrollbar(left_panel, orient="vertical", command=canvas.yview)
-
         scrollable_frame = ttk.Frame(canvas)
-
         scrollable_frame.bind(
             "<Configure>",
             lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
         )
-
         canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
-
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.bind_all("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
 
-        def _on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        # ── Mission status panel ──────────────────────────────────────────
+        mission_frame = ttk.LabelFrame(scrollable_frame, text="Mission Status")
+        mission_frame.pack(fill=tk.X, expand=False, padx=(0, 8), pady=(0, 8))
 
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        self._mission_status_var = tk.StringVar(value=MISSION_LABELS["idle"])
+        self._mission_status_label = tk.Label(
+            mission_frame,
+            textvariable=self._mission_status_var,
+            font=("Helvetica", 11, "bold"),
+            fg=MISSION_COLORS["idle"],
+            wraplength=280,
+            justify=tk.LEFT,
+        )
+        self._mission_status_label.pack(fill=tk.X, padx=6, pady=6)
 
+        self._target_coords_var = tk.StringVar(value="Target: not yet detected")
+        tk.Label(
+            mission_frame,
+            textvariable=self._target_coords_var,
+            font=("Helvetica", 9),
+            justify=tk.LEFT,
+        ).pack(fill=tk.X, padx=6, pady=(0, 6))
+
+        # ── Robot table ───────────────────────────────────────────────────
         robots_frame = ttk.LabelFrame(scrollable_frame, text="Robots")
         robots_frame.pack(fill=tk.X, expand=False, padx=(0, 8), pady=(0, 8))
 
         columns = ("robot_id", "state", "x", "y", "theta")
         self.tree = ttk.Treeview(robots_frame, columns=columns, show="headings", height=4)
-
         for col in columns:
             self.tree.heading(col, text=col)
-
         self.tree.column("robot_id", width=80, anchor="center")
-        self.tree.column("state", width=70, anchor="center")
-        self.tree.column("x", width=50, anchor="center")
-        self.tree.column("y", width=50, anchor="center")
-        self.tree.column("theta", width=60, anchor="center")
-
+        self.tree.column("state",    width=90, anchor="center")
+        self.tree.column("x",        width=50, anchor="center")
+        self.tree.column("y",        width=50, anchor="center")
+        self.tree.column("theta",    width=60, anchor="center")
         self.tree.pack(fill=tk.X, expand=False)
 
-        # Right panel: one large arena plot
+        # ── Arena plot ────────────────────────────────────────────────────
         right_panel = ttk.Frame(mainframe)
         right_panel.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
         self.fig = Figure(figsize=(10, 8), tight_layout=True)
         self.ax_traj = self.fig.add_subplot(111)
+        self.canvas_plot = FigureCanvasTkAgg(self.fig, master=right_panel)
+        self.canvas_plot.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-        self.canvas = FigureCanvasTkAgg(self.fig, master=right_panel)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-
-        # Create Control Board  
-        controls_frame = ttk.LabelFrame(scrollable_frame, text="Test Commands")
+        # ── Manual controls ───────────────────────────────────────────────
+        controls_frame = ttk.LabelFrame(scrollable_frame, text="Robot Controls")
         controls_frame.pack(fill=tk.X, expand=False, padx=(0, 8), pady=(8, 0))
 
         ttk.Label(controls_frame, text="Target Robot:").pack(fill=tk.X, pady=(4, 2))
-
         self.selected_robot_var = tk.StringVar(value="")
         self.robot_selector = ttk.Combobox(
-            controls_frame,
-            textvariable=self.selected_robot_var,
-            state="readonly",
-            values=[],
+            controls_frame, textvariable=self.selected_robot_var,
+            state="readonly", values=[],
         )
-        self.robot_selector.pack(fill=tk.X, pady=(0, 6))
+        self.robot_selector.pack(fill=tk.X, pady=(0, 4))
 
-        self.selected_robot_summary_var = tk.StringVar(
-            value="Select a robot to send a test path."
-        )
-        ttk.Label(
-            controls_frame,
-            textvariable=self.selected_robot_summary_var,
-            wraplength=280,
-            justify=tk.LEFT,
-        ).pack(fill=tk.X, pady=(0, 6))
+        self.selected_robot_summary_var = tk.StringVar(value="Select a robot.")
+        ttk.Label(controls_frame, textvariable=self.selected_robot_summary_var,
+                  wraplength=280, justify=tk.LEFT).pack(fill=tk.X, pady=(0, 6))
 
-        ttk.Button(controls_frame, text="Pause", command=self._send_pause).pack(fill=tk.X, pady=2)
-        ttk.Button(controls_frame, text="Resume", command=self._send_resume).pack(fill=tk.X, pady=2)
-        ttk.Button(controls_frame, text="Stop", command=self._send_stop).pack(fill=tk.X, pady=2)
-        ttk.Button(controls_frame, text="Toggle Gripper", command=self._send_toggle_gripper).pack(fill=tk.X, pady=2)
-        ttk.Button(controls_frame, text="Send Straight Test", command=self._send_straight_test_path).pack(fill=tk.X, pady=2)
-        ttk.Button(controls_frame, text="Send 180 Turn Test", command=self._send_turnaround_test_path).pack(fill=tk.X, pady=2)
-        ttk.Button(controls_frame, text="Send L Test Path", command=self._send_test_path).pack(fill=tk.X, pady=2)
+        for label, cmd in [
+            ("Pause",             self._send_pause),
+            ("Resume",            self._send_resume),
+            ("Stop",              self._send_stop),
+            ("Toggle Gripper",    self._send_toggle_gripper),
+            ("Send Straight Test",self._send_straight_test_path),
+            ("Send 180 Turn Test",self._send_turnaround_test_path),
+            ("Send L Test Path",  self._send_test_path),
+        ]:
+            ttk.Button(controls_frame, text=label, command=cmd).pack(fill=tk.X, pady=2)
 
-        coordination_frame = ttk.LabelFrame(scrollable_frame, text="Grid Coordination")
-        coordination_frame.pack(fill=tk.X, expand=False, padx=(0, 8), pady=(8, 0))
+        # ── Retrieval mission panel ───────────────────────────────────────
+        mission_ctrl_frame = ttk.LabelFrame(scrollable_frame, text="Retrieval Mission")
+        mission_ctrl_frame.pack(fill=tk.X, expand=False, padx=(0, 8), pady=(8, 0))
 
-        ttk.Label(
-            coordination_frame,
-            text="4m x 4m arena split into 40 x 40 cells at 10 cm resolution.",
-            wraplength=280,
-            justify=tk.LEFT,
-        ).pack(fill=tk.X, pady=(4, 6))
+        ttk.Label(mission_ctrl_frame,
+                  text="Manually set target position and launch mission.\n"
+                       "Vision will override these when it detects the door.",
+                  wraplength=280, justify=tk.LEFT).pack(fill=tk.X, padx=4, pady=(4, 6))
 
-        ttk.Label(coordination_frame, text="Robot 1").pack(fill=tk.X)
-
-        self.grid_robot_one_var = tk.StringVar(value="")
-        self.grid_robot_one_selector = ttk.Combobox(
-            coordination_frame,
-            textvariable=self.grid_robot_one_var,
-            state="readonly",
-            values=[],
-        )
-        self.grid_robot_one_selector.pack(fill=tk.X, pady=(0, 4))
-
-        robot_one_goal = ttk.Frame(coordination_frame)
-        robot_one_goal.pack(fill=tk.X, pady=(0, 6))
-
-        ttk.Label(robot_one_goal, text="Goal row").grid(row=0, column=0, sticky="w")
-        self.grid_robot_one_row_var = tk.StringVar(value="10")
-        ttk.Entry(robot_one_goal, textvariable=self.grid_robot_one_row_var, width=6).grid(row=0, column=1, padx=(6, 12))
-        ttk.Label(robot_one_goal, text="Goal col").grid(row=0, column=2, sticky="w")
-        self.grid_robot_one_col_var = tk.StringVar(value="10")
-        ttk.Entry(robot_one_goal, textvariable=self.grid_robot_one_col_var, width=6).grid(row=0, column=3, padx=(6, 0))
-        ttk.Label(coordination_frame, text="Robot 2").pack(fill=tk.X)
-
-        self.grid_robot_two_var = tk.StringVar(value="")
-        self.grid_robot_two_selector = ttk.Combobox(
-            coordination_frame,
-            textvariable=self.grid_robot_two_var,
-            state="readonly",
-            values=[],
-        )
-        self.grid_robot_two_selector.pack(fill=tk.X, pady=(0, 4))
-
-        robot_two_goal = ttk.Frame(coordination_frame)
-        robot_two_goal.pack(fill=tk.X, pady=(0, 6))
-
-        ttk.Label(robot_two_goal, text="Goal row").grid(row=0, column=0, sticky="w")
-        self.grid_robot_two_row_var = tk.StringVar(value="20")
-        ttk.Entry(robot_two_goal, textvariable=self.grid_robot_two_row_var, width=6).grid(row=0, column=1, padx=(6, 12))
-        ttk.Label(robot_two_goal, text="Goal col").grid(row=0, column=2, sticky="w")
-        self.grid_robot_two_col_var = tk.StringVar(value="20")
-        ttk.Entry(robot_two_goal, textvariable=self.grid_robot_two_col_var, width=6).grid(row=0, column=3, padx=(6, 0))
-
-        self.grid_plan_summary_var = tk.StringVar(value="Select two robots and set destination cells (0-39).")
-        ttk.Label(
-            coordination_frame,
-            textvariable=self.grid_plan_summary_var,
-            wraplength=280,
-            justify=tk.LEFT,
-        ).pack(fill=tk.X, pady=(0, 6))
+        coord_row = ttk.Frame(mission_ctrl_frame)
+        coord_row.pack(fill=tk.X, padx=4, pady=(0, 6))
+        ttk.Label(coord_row, text="X (cm)").grid(row=0, column=0, sticky="w")
+        self.mission_x_var = tk.StringVar(value="200")
+        ttk.Entry(coord_row, textvariable=self.mission_x_var, width=7).grid(row=0, column=1, padx=(4, 12))
+        ttk.Label(coord_row, text="Y (cm)").grid(row=0, column=2, sticky="w")
+        self.mission_y_var = tk.StringVar(value="200")
+        ttk.Entry(coord_row, textvariable=self.mission_y_var, width=7).grid(row=0, column=3, padx=(4, 0))
 
         ttk.Button(
-            coordination_frame,
-            text="Start Two-Robot Traverse",
-            command=self._send_two_robot_traverse,
-        ).pack(fill=tk.X, pady=2)
+            mission_ctrl_frame, text="Start Retrieval Mission",
+            command=self._send_retrieval_mission,
+        ).pack(fill=tk.X, padx=4, pady=(0, 4))
 
+        ttk.Button(
+            mission_ctrl_frame, text="Reset Mission",
+            command=self._reset_mission,
+        ).pack(fill=tk.X, padx=4, pady=(0, 6))
+
+        # ── Coordinated traverse panel ────────────────────────────────────
+        coord_frame = ttk.LabelFrame(scrollable_frame, text="Grid Coordination")
+        coord_frame.pack(fill=tk.X, expand=False, padx=(0, 8), pady=(8, 0))
+
+        ttk.Label(coord_frame,
+                  text="40×40 grid at 10 cm resolution.",
+                  wraplength=280, justify=tk.LEFT).pack(fill=tk.X, pady=(4, 6))
+
+        for label, robot_var_name, row_var_name, col_var_name, row_default, col_default in [
+            ("Robot 1", "grid_robot_one_var", "grid_robot_one_row_var", "grid_robot_one_col_var", "10", "10"),
+            ("Robot 2", "grid_robot_two_var", "grid_robot_two_row_var", "grid_robot_two_col_var", "20", "20"),
+        ]:
+            ttk.Label(coord_frame, text=label).pack(fill=tk.X)
+            setattr(self, robot_var_name, tk.StringVar(value=""))
+            combo = ttk.Combobox(coord_frame, textvariable=getattr(self, robot_var_name),
+                                 state="readonly", values=[])
+            combo.pack(fill=tk.X, pady=(0, 4))
+            goal_row = ttk.Frame(coord_frame)
+            goal_row.pack(fill=tk.X, pady=(0, 6))
+            ttk.Label(goal_row, text="Goal row").grid(row=0, column=0, sticky="w")
+            setattr(self, row_var_name, tk.StringVar(value=row_default))
+            ttk.Entry(goal_row, textvariable=getattr(self, row_var_name), width=6).grid(row=0, column=1, padx=(4, 12))
+            ttk.Label(goal_row, text="Goal col").grid(row=0, column=2, sticky="w")
+            setattr(self, col_var_name, tk.StringVar(value=col_default))
+            ttk.Entry(goal_row, textvariable=getattr(self, col_var_name), width=6).grid(row=0, column=3, padx=(4, 0))
+
+        self.grid_plan_summary_var = tk.StringVar(value="Select two robots and set destination cells (0–39).")
+        ttk.Label(coord_frame, textvariable=self.grid_plan_summary_var,
+                  wraplength=280, justify=tk.LEFT).pack(fill=tk.X, pady=(0, 6))
+        ttk.Button(coord_frame, text="Start Two-Robot Traverse",
+                   command=self._send_two_robot_traverse).pack(fill=tk.X, pady=2)
+
+    # ----------------------------
+    # Helpers
+    # ----------------------------
     def _get_robot_color(self, robot_id: str) -> str:
         if robot_id not in self.robot_colors:
             self.robot_colors[robot_id] = next(self.color_cycle)
         return self.robot_colors[robot_id]
 
-    def _draw_robot_safety_box(self, ax, x: float, y: float, theta_deg: float, label: str, color: str):
-        """
-        Draw a rotated 40cm x 40cm safety square centered on the robot.
-        """
+    def _draw_robot_safety_box(self, ax, x, y, theta_deg, label, color):
         half = self.SAFETY_BOX_HALF_CM
         theta_rad = math.radians(theta_deg)
-
-        # Square corners in robot-local coordinates
-        local_corners = [
-            (-half, -half),
-            ( half, -half),
-            ( half,  half),
-            (-half,  half),
+        local = [(-half, -half), (half, -half), (half, half), (-half, half)]
+        world = [
+            (x + lx * math.cos(theta_rad) - ly * math.sin(theta_rad),
+             y + lx * math.sin(theta_rad) + ly * math.cos(theta_rad))
+            for lx, ly in local
         ]
+        ax.add_patch(Polygon(world, closed=True, fill=False,
+                             linewidth=1.5, linestyle="-", alpha=0.8,
+                             label=label, edgecolor=color))
 
-        world_corners = []
-        for lx, ly in local_corners:
-            wx = x + lx * math.cos(theta_rad) - ly * math.sin(theta_rad)
-            wy = y + lx * math.sin(theta_rad) + ly * math.cos(theta_rad)
-            world_corners.append((wx, wy))
+    def _world_sensor_position(self, x, y, theta_deg, fwd, lat):
+        theta_rad = math.radians(theta_deg)
+        sx = x + fwd * math.cos(theta_rad) - lat * math.sin(theta_rad)
+        sy = y + fwd * math.sin(theta_rad) + lat * math.cos(theta_rad)
+        return sx, sy
 
-        patch = Polygon(
-            world_corners,
-            closed=True,
-            fill=False,
-            linewidth=1.5,
-            linestyle="-",
-            alpha=0.8,
-            label=label,
-            edgecolor=color,
-        )
-        ax.add_patch(patch)
+    def _compute_echo_point(self, x, y, theta_deg, dist_cm, fwd, lat, angle_offset):
+        if not (self.MIN_VALID_ULTRASONIC_CM <= dist_cm <= self.MAX_VALID_ULTRASONIC_CM):
+            return None
+        sx, sy = self._world_sensor_position(x, y, theta_deg, fwd, lat)
+        ray_rad = math.radians(theta_deg + angle_offset)
+        return sx + dist_cm * math.cos(ray_rad), sy + dist_cm * math.sin(ray_rad)
+
+    def _draw_latest_ray(self, ax, x, y, theta_deg, dist_cm, fwd, lat, angle_offset, label, linestyle, color):
+        if not (self.MIN_VALID_ULTRASONIC_CM <= dist_cm <= self.MAX_VALID_ULTRASONIC_CM):
+            return
+        sx, sy = self._world_sensor_position(x, y, theta_deg, fwd, lat)
+        ray_rad = math.radians(theta_deg + angle_offset)
+        ex = sx + dist_cm * math.cos(ray_rad)
+        ey = sy + dist_cm * math.sin(ray_rad)
+        ax.plot([sx, ex], [sy, ey], linestyle=linestyle, label=label, color=color, alpha=0.6)
+
+    def _prune_echo_history(self, hist, current_t_s):
+        cutoff = current_t_s - self.ECHO_WINDOW_S
+        for key_t, key_x, key_y in [
+            ("front_echo_t", "front_echo_x", "front_echo_y"),
+            ("left_echo_t",  "left_echo_x",  "left_echo_y"),
+        ]:
+            while hist[key_t] and hist[key_t][0] < cutoff:
+                hist[key_t].pop(0)
+                hist[key_x].pop(0)
+                hist[key_y].pop(0)
 
     # ----------------------------
     # Queue processing
     # ----------------------------
-    def _prune_echo_history(self, hist: dict, current_t_s: float):
-        cutoff_t_s = current_t_s - self.ECHO_WINDOW_S
-
-        while hist["front_echo_t"] and hist["front_echo_t"][0] < cutoff_t_s:
-            hist["front_echo_t"].pop(0)
-            hist["front_echo_x"].pop(0)
-            hist["front_echo_y"].pop(0)
-
-        while hist["left_echo_t"] and hist["left_echo_t"][0] < cutoff_t_s:
-            hist["left_echo_t"].pop(0)
-            hist["left_echo_x"].pop(0)
-            hist["left_echo_y"].pop(0)
-
     def _process_queue(self):
         updated = False
 
+        # Mission state updates
+        while not self.mission_queue.empty():
+            state, tx, ty = self.mission_queue.get()
+            self._mission_state = state
+            if tx is not None:
+                self._target_x_cm = tx
+            if ty is not None:
+                self._target_y_cm = ty
+            self._mission_status_var.set(MISSION_LABELS.get(state, state))
+            self._mission_status_label.config(fg=MISSION_COLORS.get(state, "#888888"))
+            if self._target_x_cm is not None:
+                self._target_coords_var.set(
+                    f"Target: ({self._target_x_cm:.0f}, {self._target_y_cm:.0f}) cm"
+                )
+            updated = True
+
+        # Telemetry and path overlay updates
         while not self.telemetry_queue.empty():
-            robot_id, telemetry = self.telemetry_queue.get()
+            item = self.telemetry_queue.get()
 
+            if item[0] == "path_overlay":
+                _, robot_id, waypoints = item
+                self.planned_paths[robot_id] = waypoints
+                updated = True
+                continue
+
+            _, robot_id, telemetry = item
             self.robot_states[robot_id] = telemetry
-            hist = self.robot_history[robot_id]
 
-            t = telemetry.get("t_ms")
-            x = telemetry.get("x_cm")
-            y = telemetry.get("y_cm")
+            # Update planned path from arbiter snapshot if present
+            if "planned_path_cells" in telemetry:
+                cells = telemetry["planned_path_cells"]
+                if cells:
+                    self.planned_paths[robot_id] = [
+                        (col * 10 + 5, row * 10 + 5) for row, col in cells
+                    ]
+
+            hist = self.robot_history[robot_id]
+            t    = telemetry.get("t_ms")
+            x    = telemetry.get("x_cm")
+            y    = telemetry.get("y_cm")
             theta = telemetry.get("theta_deg")
             front = telemetry.get("front_ultrasonic_cm")
-            left = telemetry.get("left_ultrasonic_cm")
-            t_s = float(t) / 1000.0 if t is not None else None
+            left  = telemetry.get("left_ultrasonic_cm")
+            t_s   = float(t) / 1000.0 if t is not None else None
 
-            if t is not None:
-                hist["t"].append(t_s)
-            if x is not None:
-                hist["x"].append(float(x))
-            if y is not None:
-                hist["y"].append(float(y))
-            if theta is not None:
-                hist["theta"].append(float(theta))
-            if front is not None:
-                hist["front_ultra"].append(float(front))
-            if left is not None:
-                hist["left_ultra"].append(float(left))
+            if t_s is not None: hist["t"].append(t_s)
+            if x    is not None: hist["x"].append(float(x))
+            if y    is not None: hist["y"].append(float(y))
+            if theta is not None: hist["theta"].append(float(theta))
+            if front is not None: hist["front_ultra"].append(float(front))
+            if left  is not None: hist["left_ultra"].append(float(left))
 
             if x is not None and y is not None and theta is not None:
-                x = float(x)
-                y = float(y)
-                theta = float(theta)
-
+                fx, fy = float(x), float(y)
+                ft = float(theta)
                 if front is not None:
-                    pt = self._compute_echo_point(
-                        x, y, theta, float(front),
-                        self.FRONT_SENSOR_FORWARD_OFFSET_CM,
-                        self.FRONT_SENSOR_LATERAL_OFFSET_CM,
-                        self.FRONT_SENSOR_ANGLE_OFFSET_DEG,
-                    )
-                    if pt is not None:
-                        ex, ey = pt
-                        hist["front_echo_t"].append(t_s if t_s is not None else 0.0)
-                        hist["front_echo_x"].append(ex)
-                        hist["front_echo_y"].append(ey)
-
+                    pt = self._compute_echo_point(fx, fy, ft, float(front),
+                         self.FRONT_SENSOR_FORWARD_OFFSET_CM, self.FRONT_SENSOR_LATERAL_OFFSET_CM,
+                         self.FRONT_SENSOR_ANGLE_OFFSET_DEG)
+                    if pt:
+                        hist["front_echo_t"].append(t_s or 0.0)
+                        hist["front_echo_x"].append(pt[0])
+                        hist["front_echo_y"].append(pt[1])
                 if left is not None:
-                    pt = self._compute_echo_point(
-                        x, y, theta, float(left),
-                        self.LEFT_SENSOR_FORWARD_OFFSET_CM,
-                        self.LEFT_SENSOR_LATERAL_OFFSET_CM,
-                        self.LEFT_SENSOR_ANGLE_OFFSET_DEG,
-                    )
-                    if pt is not None:
-                        ex, ey = pt
-                        hist["left_echo_t"].append(t_s if t_s is not None else 0.0)
-                        hist["left_echo_x"].append(ex)
-                        hist["left_echo_y"].append(ey)
+                    pt = self._compute_echo_point(fx, fy, ft, float(left),
+                         self.LEFT_SENSOR_FORWARD_OFFSET_CM, self.LEFT_SENSOR_LATERAL_OFFSET_CM,
+                         self.LEFT_SENSOR_ANGLE_OFFSET_DEG)
+                    if pt:
+                        hist["left_echo_t"].append(t_s or 0.0)
+                        hist["left_echo_x"].append(pt[0])
+                        hist["left_echo_y"].append(pt[1])
 
             if t_s is not None:
                 self._prune_echo_history(hist, t_s)
@@ -394,443 +425,345 @@ class TelemetryGUI:
         self.root.after(100, self._process_queue)
 
     # ----------------------------
-    # Math helpers
+    # Plot
     # ----------------------------
-    def _world_sensor_position(
-        self,
-        x: float,
-        y: float,
-        theta_deg: float,
-        forward_offset_cm: float,
-        lateral_offset_cm: float,
-    ):
-        theta_rad = math.radians(theta_deg)
-
-        sensor_x = (
-            x
-            + forward_offset_cm * math.cos(theta_rad)
-            - lateral_offset_cm * math.sin(theta_rad)
-        )
-        sensor_y = (
-            y
-            + forward_offset_cm * math.sin(theta_rad)
-            + lateral_offset_cm * math.cos(theta_rad)
-        )
-        return sensor_x, sensor_y
-
-    def _compute_echo_point(
-        self,
-        x: float,
-        y: float,
-        theta_deg: float,
-        ultrasonic_cm: float,
-        forward_offset_cm: float,
-        lateral_offset_cm: float,
-        sensor_angle_offset_deg: float,
-    ):
-        if not (self.MIN_VALID_ULTRASONIC_CM <= ultrasonic_cm <= self.MAX_VALID_ULTRASONIC_CM):
-            return None
-
-        sensor_x, sensor_y = self._world_sensor_position(
-            x, y, theta_deg, forward_offset_cm, lateral_offset_cm
-        )
-
-        ray_angle_deg = theta_deg + sensor_angle_offset_deg
-        ray_angle_rad = math.radians(ray_angle_deg)
-
-        ex = sensor_x + ultrasonic_cm * math.cos(ray_angle_rad)
-        ey = sensor_y + ultrasonic_cm * math.sin(ray_angle_rad)
-
-        return ex, ey
-
-    def _draw_latest_ray(
-        self,
-        ax,
-        x: float,
-        y: float,
-        theta_deg: float,
-        ultrasonic_cm: float,
-        forward_offset_cm: float,
-        lateral_offset_cm: float,
-        sensor_angle_offset_deg: float,
-        label: str,
-        linestyle: str,
-        color: str,
-    ):
-        if not (self.MIN_VALID_ULTRASONIC_CM <= ultrasonic_cm <= self.MAX_VALID_ULTRASONIC_CM):
-            return
-
-        sensor_x, sensor_y = self._world_sensor_position(
-            x, y, theta_deg, forward_offset_cm, lateral_offset_cm
-        )
-
-        ray_angle_rad = math.radians(theta_deg + sensor_angle_offset_deg)
-        ex = sensor_x + ultrasonic_cm * math.cos(ray_angle_rad)
-        ey = sensor_y + ultrasonic_cm * math.sin(ray_angle_rad)
-
-        ax.plot([sensor_x, ex], [sensor_y, ey], linestyle=linestyle, label=label, color=color)
-
-    # ----------------------------
-    # Refresh UI
-    # ----------------------------
-    def _refresh_table(self):
-        self.tree.delete(*self.tree.get_children())
-
-        for robot_id, state in self.robot_states.items():
-            self.tree.insert(
-                "",
-                "end",
-                values=(
-                    robot_id,
-                    state.get("state", ""),
-                    round(float(state.get("x_cm", 0.0)), 2),
-                    round(float(state.get("y_cm", 0.0)), 2),
-                    round(float(state.get("theta_deg", 0.0)), 2),
-                ),
-            )
-
     def _refresh_plot(self):
         self.ax_traj.clear()
 
-        self.ax_traj.set_title("Robot Trajectory + Ultrasonic Points")
+        self.ax_traj.set_title("Fleet Arena — Live View", fontsize=12)
         self.ax_traj.set_xlabel("x (cm)")
         self.ax_traj.set_ylabel("y (cm)")
-
-        # Arena is 0 → 400 cm
         self.ax_traj.set_xlim(0, self.ARENA_SIZE_CM)
         self.ax_traj.set_ylim(0, self.ARENA_SIZE_CM)
-
-        # Keep physical scale equal
         self.ax_traj.set_aspect("equal", adjustable="box")
-
-        # Major ticks every 50 cm (labels)
         self.ax_traj.xaxis.set_major_locator(MultipleLocator(50))
         self.ax_traj.yaxis.set_major_locator(MultipleLocator(50))
-
-        # Minor ticks every 10 cm (grid squares)
         self.ax_traj.xaxis.set_minor_locator(MultipleLocator(10))
         self.ax_traj.yaxis.set_minor_locator(MultipleLocator(10))
-
-        # Draw grids
         self.ax_traj.grid(which="major", linewidth=1.0)
         self.ax_traj.grid(which="minor", linewidth=0.3)
 
+        # ── Target marker ─────────────────────────────────────────────────
+        if self._target_x_cm is not None and self._target_y_cm is not None:
+            tx, ty = self._target_x_cm, self._target_y_cm
+            color = MISSION_COLORS.get(self._mission_state, "red")
+
+            # Pulsing X marker
+            self.ax_traj.plot(tx, ty, "x", color=color,
+                              markersize=18, markeredgewidth=3, zorder=10,
+                              label="Target (car door)")
+
+            # Dashed circle around target
+            circle = plt_circle = __import__("matplotlib.patches", fromlist=["Circle"]).Circle(
+                (tx, ty), 15, fill=False, linestyle="--",
+                edgecolor=color, linewidth=1.5, alpha=0.7, zorder=9,
+            )
+            self.ax_traj.add_patch(circle)
+
+            self.ax_traj.annotate(
+                f"Target\n({tx:.0f}, {ty:.0f})",
+                xy=(tx, ty), xytext=(tx + 20, ty + 20),
+                fontsize=8, color=color,
+                arrowprops=dict(arrowstyle="->", color=color, lw=1.0),
+            )
+
+        # ── Staging position marker ───────────────────────────────────────
+        # Import here to keep top-level clean
+        staging_x = 50.0
+        staging_y = 50.0
+        self.ax_traj.plot(staging_x, staging_y, "s",
+                          color="tab:gray", markersize=10, alpha=0.5,
+                          label="Robot B staging", zorder=5)
+
+        # ── Planned path overlays ─────────────────────────────────────────
+        for robot_id, path_waypoints in self.planned_paths.items():
+            if len(path_waypoints) < 2:
+                continue
+            color = self._get_robot_color(robot_id)
+            xs = [p[0] for p in path_waypoints]
+            ys = [p[1] for p in path_waypoints]
+            self.ax_traj.plot(xs, ys,
+                              linestyle="--", linewidth=1.5,
+                              color=color, alpha=0.45,
+                              label=f"{robot_id} planned path", zorder=4)
+            # Arrow at midpoint to show direction
+            mid = len(xs) // 2
+            if mid > 0:
+                dx = xs[mid] - xs[mid - 1]
+                dy = ys[mid] - ys[mid - 1]
+                self.ax_traj.annotate(
+                    "", xy=(xs[mid], ys[mid]),
+                    xytext=(xs[mid] - dx * 0.001, ys[mid] - dy * 0.001),
+                    arrowprops=dict(arrowstyle="-|>", color=color, lw=1.5, alpha=0.6),
+                )
+
+        # ── Robot trajectories ────────────────────────────────────────────
         for robot_id, hist in self.robot_history.items():
             xs = hist["x"]
             ys = hist["y"]
             color = self._get_robot_color(robot_id)
 
             if xs and ys:
-                self.ax_traj.plot(xs, ys, marker="o", linestyle="-", label=f"{robot_id} path", color=color)
+                self.ax_traj.plot(xs, ys, marker=".", markersize=3,
+                                  linestyle="-", alpha=0.4,
+                                  label=f"{robot_id} trail", color=color)
 
-                theta_deg = hist["theta"][-1]
+                theta_deg = hist["theta"][-1] if hist["theta"] else 0.0
                 theta_rad = math.radians(theta_deg)
-                arrow_len = 8.0
-                dx = arrow_len * math.cos(theta_rad)
-                dy = arrow_len * math.sin(theta_rad)
+                arrow_len = 10.0
 
+                # Robot body dot
+                self.ax_traj.scatter([xs[-1]], [ys[-1]], s=80,
+                                     label=f"{robot_id}", zorder=6, color=color)
+
+                # Heading arrow
                 self.ax_traj.arrow(
-                    xs[-1],
-                    ys[-1],
-                    dx,
-                    dy,
-                    head_width=3.0,
-                    head_length=4.0,
+                    xs[-1], ys[-1],
+                    arrow_len * math.cos(theta_rad),
+                    arrow_len * math.sin(theta_rad),
+                    head_width=4.0, head_length=5.0,
                     length_includes_head=True,
+                    color=color, zorder=7,
                 )
 
-                # Robot center point
-                self.ax_traj.scatter(
-                    [xs[-1]],
-                    [ys[-1]],
-                    s=50,
-                    label=f"{robot_id} center",
-                    zorder=5,
-                    color=color,
-                )
+                # Safety box
+                self._draw_robot_safety_box(self.ax_traj, xs[-1], ys[-1], theta_deg,
+                                            label=f"{robot_id} safety box", color=color)
 
-                # Rotated safety box
-                self._draw_robot_safety_box(
-                    self.ax_traj,
-                    xs[-1],
-                    ys[-1],
-                    theta_deg,
-                    label=f"{robot_id} safety box",
-                    color=color,
-                )
-
+                # Ultrasonic rays
                 if hist["front_ultra"]:
                     self._draw_latest_ray(
-                        self.ax_traj,
-                        xs[-1],
-                        ys[-1],
-                        theta_deg,
-                        hist["front_ultra"][-1],
-                        self.FRONT_SENSOR_FORWARD_OFFSET_CM,
-                        self.FRONT_SENSOR_LATERAL_OFFSET_CM,
+                        self.ax_traj, xs[-1], ys[-1], theta_deg, hist["front_ultra"][-1],
+                        self.FRONT_SENSOR_FORWARD_OFFSET_CM, self.FRONT_SENSOR_LATERAL_OFFSET_CM,
                         self.FRONT_SENSOR_ANGLE_OFFSET_DEG,
-                        label=f"{robot_id} latest front ray",
-                        linestyle="--",
-                        color=color,
+                        f"{robot_id} front sonar", "--", color,
                     )
 
-            if hist["front_echo_x"] and hist["front_echo_y"]:
-                self.ax_traj.scatter(
-                    hist["front_echo_x"],
-                    hist["front_echo_y"],
-                    s=20,
-                    alpha=0.75,
-                    label=f"{robot_id} front hits",
-                    color=color,
-                )
+            # Ultrasonic echo scatter points
+            for ex_key, ey_key, elabel in [
+                ("front_echo_x", "front_echo_y", f"{robot_id} front hits"),
+                ("left_echo_x",  "left_echo_y",  f"{robot_id} left hits"),
+            ]:
+                if hist[ex_key] and hist[ey_key]:
+                    self.ax_traj.scatter(hist[ex_key], hist[ey_key],
+                                         s=15, alpha=0.6, label=elabel, color=color)
 
-            if hist["left_echo_x"] and hist["left_echo_y"]:
-                self.ax_traj.scatter(
-                    hist["left_echo_x"],
-                    hist["left_echo_y"],
-                    s=20,
-                    alpha=0.75,
-                    label=f"{robot_id} left hits",
-                    color=color,
-                )
+        # ── Mission state banner ──────────────────────────────────────────
+        banner_color = MISSION_COLORS.get(self._mission_state, "#888888")
+        banner_text  = MISSION_LABELS.get(self._mission_state, self._mission_state)
+        self.ax_traj.text(
+            0.5, 0.98, banner_text,
+            transform=self.ax_traj.transAxes,
+            fontsize=10, fontweight="bold",
+            color=banner_color, ha="center", va="top",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.7, edgecolor=banner_color),
+        )
 
         handles, labels = self.ax_traj.get_legend_handles_labels()
         unique = dict(zip(labels, handles))
         if unique:
-            self.ax_traj.legend(unique.values(), unique.keys(), loc="best")
+            self.ax_traj.legend(unique.values(), unique.keys(),
+                                loc="lower right", fontsize=7)
 
-        self.canvas.draw()
-    
+        self.canvas_plot.draw()
+
+    def _refresh_table(self):
+        self.tree.delete(*self.tree.get_children())
+        for robot_id, state in self.robot_states.items():
+            self.tree.insert("", "end", values=(
+                robot_id,
+                state.get("state", ""),
+                round(float(state.get("x_cm", 0.0)), 1),
+                round(float(state.get("y_cm", 0.0)), 1),
+                round(float(state.get("theta_deg", 0.0)), 1),
+            ))
+
+    def _refresh_robot_selector(self):
+        robot_ids = sorted(self.robot_states.keys())
+        for combo_var, combo_name in [
+            (self.selected_robot_var,  "robot_selector"),
+            (self.grid_robot_one_var,  "grid_robot_one_selector"),
+            (self.grid_robot_two_var,  "grid_robot_two_selector"),
+        ]:
+            widget = getattr(self, combo_name, None)
+            if widget:
+                widget["values"] = robot_ids
+            if combo_var.get() not in robot_ids and robot_ids:
+                combo_var.set(robot_ids[0])
+
+        if not self.grid_robot_two_var.get() and len(robot_ids) > 1:
+            self.grid_robot_two_var.set(robot_ids[1])
+
+        selected_state = self.robot_states.get(self.selected_robot_var.get())
+        if selected_state:
+            robot_id = self.selected_robot_var.get()
+            self.selected_robot_summary_var.set(
+                f"{robot_id}: {selected_state.get('state','?')}  "
+                f"({float(selected_state.get('x_cm',0)):.0f}, "
+                f"{float(selected_state.get('y_cm',0)):.0f}) cm  "
+                f"{float(selected_state.get('theta_deg',0)):.0f}°"
+            )
+        else:
+            self.selected_robot_summary_var.set("Select a robot.")
+
     # ----------------------------
-    # Control Board
+    # Command senders
     # ----------------------------
-    def _get_selected_robot_id(self) -> str | None:
-        robot_id = self.selected_robot_var.get().strip()
-        if not robot_id:
-            return None
-        return robot_id
+    def _get_selected_robot_id(self):
+        v = self.selected_robot_var.get().strip()
+        return v if v else None
 
-    def _get_selected_robot_state(self) -> dict | None:
-        robot_id = self._get_selected_robot_id()
-        if robot_id is None:
-            return None
-        return self.robot_states.get(robot_id)
+    def _get_selected_robot_state(self):
+        rid = self._get_selected_robot_id()
+        return self.robot_states.get(rid) if rid else None
 
-    def _get_test_distance_cm(self) -> float:
-        return self.DEFAULT_TEST_DISTANCE_CM
-
-    def _get_motion_settings(self) -> MotionSettings:
+    def _get_motion_settings(self):
         return MotionSettings(
             turn_speed_deg_per_sec=self.DEFAULT_TURN_SPEED,
             drive_speed_deg_per_sec=self.DEFAULT_DRIVE_SPEED,
         )
 
-    def _next_test_path_id(self) -> int:
+    def _next_test_path_id(self):
         self.test_path_counter += 1
         return self.test_path_counter
 
     def _send_pause(self):
-        robot_id = self._get_selected_robot_id()
-        if robot_id and self.command_sender:
-            msg = PauseMessage(
-                robot_id=robot_id,
-                reason="gui_pause_button",
-            )
-            self.command_sender(msg)
+        rid = self._get_selected_robot_id()
+        if rid and self.command_sender:
+            self.command_sender(PauseMessage(robot_id=rid, reason="gui_pause_button"))
 
     def _send_resume(self):
-        robot_id = self._get_selected_robot_id()
-        if robot_id and self.command_sender:
-            msg = ResumeMessage(robot_id=robot_id)
-            self.command_sender(msg)
+        rid = self._get_selected_robot_id()
+        if rid and self.command_sender:
+            self.command_sender(ResumeMessage(robot_id=rid))
 
     def _send_stop(self):
-        robot_id = self._get_selected_robot_id()
-        if robot_id and self.command_sender:
-            msg = StopMessage(
-                robot_id=robot_id,
-                reason="gui_stop_button",
-            )
-            self.command_sender(msg)
+        rid = self._get_selected_robot_id()
+        if rid and self.command_sender:
+            self.command_sender(StopMessage(robot_id=rid, reason="gui_stop_button"))
 
     def _send_toggle_gripper(self):
-        robot_id = self._get_selected_robot_id()
-        if robot_id and self.command_sender:
-            msg = ToggleGripperMessage(robot_id=robot_id)
-            self.command_sender(msg)
+        rid = self._get_selected_robot_id()
+        if rid and self.command_sender:
+            self.command_sender(ToggleGripperMessage(robot_id=rid))
 
     def _send_straight_test_path(self):
-        robot_id = self._get_selected_robot_id()
-        robot_state = self._get_selected_robot_state()
-
-        if not robot_id or not self.command_sender or not robot_state:
+        rid = self._get_selected_robot_id()
+        state = self._get_selected_robot_state()
+        if not rid or not state or not self.command_sender:
             return
-
-        x = float(robot_state.get("x_cm", 0.0))
-        y = float(robot_state.get("y_cm", 0.0))
-        theta_deg = float(robot_state.get("theta_deg", 0.0))
-        theta_rad = math.radians(theta_deg)
-        distance_cm = self._get_test_distance_cm()
-
-        wp_x = min(max(x + distance_cm * math.cos(theta_rad), 0.0), 400.0)
-        wp_y = min(max(y + distance_cm * math.sin(theta_rad), 0.0), 400.0)
-
-        msg = PathAssignmentMessage(
-            robot_id=robot_id,
-            path_id=self._next_test_path_id(),
-            replace_existing=True,
-            waypoints=[Waypoint(x_cm=wp_x, y_cm=wp_y)],
+        x = float(state.get("x_cm", 0.0))
+        y = float(state.get("y_cm", 0.0))
+        theta_rad = math.radians(float(state.get("theta_deg", 0.0)))
+        d = self.DEFAULT_TEST_DISTANCE_CM
+        self.command_sender(PathAssignmentMessage(
+            robot_id=rid, path_id=self._next_test_path_id(), replace_existing=True,
+            waypoints=[Waypoint(x_cm=min(max(x + d*math.cos(theta_rad), 0), 400),
+                                y_cm=min(max(y + d*math.sin(theta_rad), 0), 400))],
             motion=self._get_motion_settings(),
-        )
-
-        self.command_sender(msg)
+        ))
 
     def _send_turnaround_test_path(self):
-        robot_id = self._get_selected_robot_id()
-        robot_state = self._get_selected_robot_state()
-
-        if not robot_id or not self.command_sender or not robot_state:
+        rid = self._get_selected_robot_id()
+        state = self._get_selected_robot_state()
+        if not rid or not state or not self.command_sender:
             return
-
-        x = float(robot_state.get("x_cm", 0.0))
-        y = float(robot_state.get("y_cm", 0.0))
-        theta_deg = float(robot_state.get("theta_deg", 0.0))
-        theta_rad = math.radians(theta_deg)
-        distance_cm = self._get_test_distance_cm()
-
-        wp_x = min(max(x - distance_cm * math.cos(theta_rad), 0.0), 400.0)
-        wp_y = min(max(y - distance_cm * math.sin(theta_rad), 0.0), 400.0)
-
-        msg = PathAssignmentMessage(
-            robot_id=robot_id,
-            path_id=self._next_test_path_id(),
-            replace_existing=True,
-            waypoints=[Waypoint(x_cm=wp_x, y_cm=wp_y)],
+        x = float(state.get("x_cm", 0.0))
+        y = float(state.get("y_cm", 0.0))
+        theta_rad = math.radians(float(state.get("theta_deg", 0.0)))
+        d = self.DEFAULT_TEST_DISTANCE_CM
+        self.command_sender(PathAssignmentMessage(
+            robot_id=rid, path_id=self._next_test_path_id(), replace_existing=True,
+            waypoints=[Waypoint(x_cm=min(max(x - d*math.cos(theta_rad), 0), 400),
+                                y_cm=min(max(y - d*math.sin(theta_rad), 0), 400))],
             motion=self._get_motion_settings(),
-        )
-
-        self.command_sender(msg)
+        ))
 
     def _send_test_path(self):
-        robot_id = self._get_selected_robot_id()
-        robot_state = self._get_selected_robot_state()
-
-        if not robot_id or not self.command_sender or not robot_state:
+        rid = self._get_selected_robot_id()
+        state = self._get_selected_robot_state()
+        if not rid or not state or not self.command_sender:
             return
-
-        # Start from the robot's current believed pose and send a simple
-        # three-waypoint path in the global arena frame.
-        x = float(robot_state.get("x_cm", 0.0))
-        y = float(robot_state.get("y_cm", 0.0))
-
-        # Simple "Γ"-shaped test path, clipped to the 0..400 cm arena
-        wp1_x = min(max(x + 20.0, 0.0), 400.0)
-        wp1_y = min(max(y,         0.0), 400.0)
-
-        wp2_x = min(max(x + 40.0, 0.0), 400.0)
-        wp2_y = min(max(y,         0.0), 400.0)
-
-        wp3_x = min(max(x + 40.0, 0.0), 400.0)
-        wp3_y = min(max(y + 40.0, 0.0), 400.0)
-
-        msg = PathAssignmentMessage(
-            robot_id=robot_id,
-            path_id=self._next_test_path_id(),
-            replace_existing=True,
+        x = float(state.get("x_cm", 0.0))
+        y = float(state.get("y_cm", 0.0))
+        self.command_sender(PathAssignmentMessage(
+            robot_id=rid, path_id=self._next_test_path_id(), replace_existing=True,
             waypoints=[
-                Waypoint(x_cm=wp1_x, y_cm=wp1_y),
-                Waypoint(x_cm=wp2_x, y_cm=wp2_y),
-                Waypoint(x_cm=wp3_x, y_cm=wp3_y),
+                Waypoint(x_cm=min(max(x+20, 0), 400), y_cm=min(max(y,    0), 400)),
+                Waypoint(x_cm=min(max(x+40, 0), 400), y_cm=min(max(y,    0), 400)),
+                Waypoint(x_cm=min(max(x+40, 0), 400), y_cm=min(max(y+40, 0), 400)),
             ],
             motion=self._get_motion_settings(),
-        )
+        ))
 
-        self.command_sender(msg)
+    def _send_retrieval_mission(self):
+        if not self.command_sender:
+            return
+        try:
+            x_cm = float(self.mission_x_var.get())
+            y_cm = float(self.mission_y_var.get())
+        except ValueError:
+            self._mission_status_var.set("Invalid coordinates — enter numbers only")
+            return
 
-    def _parse_goal_cell(self, row_var: tk.StringVar, col_var: tk.StringVar) -> tuple[int, int] | None:
+        self._mission_state = "retrieving"
+        self._target_x_cm = x_cm
+        self._target_y_cm = y_cm
+        self._mission_status_var.set(MISSION_LABELS["retrieving"])
+        self._mission_status_label.config(fg=MISSION_COLORS["retrieving"])
+        self._target_coords_var.set(f"Target: ({x_cm:.0f}, {y_cm:.0f}) cm")
+
+        self.command_sender({
+            "type": "retrieval_mission",
+            "x_cm": x_cm,
+            "y_cm": y_cm,
+        })
+
+    def _reset_mission(self):
+        self._mission_state = "idle"
+        self._target_x_cm = None
+        self._target_y_cm = None
+        self.planned_paths.clear()
+        self._mission_status_var.set(MISSION_LABELS["idle"])
+        self._mission_status_label.config(fg=MISSION_COLORS["idle"])
+        self._target_coords_var.set("Target: not yet detected")
+
+    def _parse_goal_cell(self, row_var, col_var):
         try:
             row = int(row_var.get())
             col = int(col_var.get())
         except (TypeError, ValueError):
             return None
-
         if not (0 <= row < self.GRID_DIM_CELLS and 0 <= col < self.GRID_DIM_CELLS):
             return None
-
         return row, col
 
     def _send_two_robot_traverse(self):
         if not self.command_sender:
             return
-
-        robot_one = self.grid_robot_one_var.get().strip()
-        robot_two = self.grid_robot_two_var.get().strip()
-        if not robot_one or not robot_two or robot_one == robot_two:
-            self.grid_plan_summary_var.set("Pick two different robots before starting a coordinated traverse.")
+        r1 = self.grid_robot_one_var.get().strip()
+        r2 = self.grid_robot_two_var.get().strip()
+        if not r1 or not r2 or r1 == r2:
+            self.grid_plan_summary_var.set("Pick two different robots.")
             return
-
-        goal_one = self._parse_goal_cell(self.grid_robot_one_row_var, self.grid_robot_one_col_var)
-        goal_two = self._parse_goal_cell(self.grid_robot_two_row_var, self.grid_robot_two_col_var)
-        if goal_one is None or goal_two is None:
-            self.grid_plan_summary_var.set("Goal cells must be integers from 0 to 39.")
+        g1 = self._parse_goal_cell(self.grid_robot_one_row_var, self.grid_robot_one_col_var)
+        g2 = self._parse_goal_cell(self.grid_robot_two_row_var, self.grid_robot_two_col_var)
+        if g1 is None or g2 is None:
+            self.grid_plan_summary_var.set("Goal cells must be integers 0–39.")
             return
-
-        if goal_one == goal_two:
-            self.grid_plan_summary_var.set("Choose different goal cells for the two robots.")
+        if g1 == g2:
+            self.grid_plan_summary_var.set("Choose different goal cells.")
             return
-
         self.grid_plan_summary_var.set(
-            f"Planning coordinated traverse: {robot_one} -> ({goal_one[0]}, {goal_one[1]}), "
-            f"{robot_two} -> ({goal_two[0]}, {goal_two[1]})."
+            f"Planning: {r1}→({g1[0]},{g1[1]}), {r2}→({g2[0]},{g2[1]})"
         )
-
         self.command_sender({
             "type": "coordinated_traverse",
             "robots": [
-                {"robot_id": robot_one, "goal_row": goal_one[0], "goal_col": goal_one[1]},
-                {"robot_id": robot_two, "goal_row": goal_two[0], "goal_col": goal_two[1]},
+                {"robot_id": r1, "goal_row": g1[0], "goal_col": g1[1]},
+                {"robot_id": r2, "goal_row": g2[0], "goal_col": g2[1]},
             ],
         })
-    
 
-    def _refresh_robot_selector(self):
-        robot_ids = sorted(self.robot_states.keys())
-        self.robot_selector["values"] = robot_ids
-        self.grid_robot_one_selector["values"] = robot_ids
-        self.grid_robot_two_selector["values"] = robot_ids
-
-        current = self.selected_robot_var.get()
-
-        # If current selection disappeared, clear it
-        if current and current not in robot_ids:
-            self.selected_robot_var.set("")
-
-        # If nothing is selected and robots exist, pick the first one
-        if not self.selected_robot_var.get() and robot_ids:
-            self.selected_robot_var.set(robot_ids[0])
-
-        if not self.grid_robot_one_var.get() and robot_ids:
-            self.grid_robot_one_var.set(robot_ids[0])
-
-        if not self.grid_robot_two_var.get() and len(robot_ids) > 1:
-            self.grid_robot_two_var.set(robot_ids[1])
-        elif not self.grid_robot_two_var.get() and robot_ids:
-            self.grid_robot_two_var.set(robot_ids[0])
-
-        selected_state = self._get_selected_robot_state()
-        if selected_state is None:
-            self.selected_robot_summary_var.set("Select a robot to send a test path.")
-            return
-
-        robot_id = self._get_selected_robot_id()
-        state = selected_state.get("state", "unknown")
-        path_id = selected_state.get("path_id", "-")
-        waypoint_index = selected_state.get("waypoint_index", "-")
-        x = float(selected_state.get("x_cm", 0.0))
-        y = float(selected_state.get("y_cm", 0.0))
-        theta = float(selected_state.get("theta_deg", 0.0))
-
-        self.selected_robot_summary_var.set(
-            f"{robot_id}: state={state}, path={path_id}, waypoint={waypoint_index}, "
-            f"pose=({x:.1f}, {y:.1f}, {theta:.1f} deg)"
-        )
+    def run(self):
+        self.root.mainloop()

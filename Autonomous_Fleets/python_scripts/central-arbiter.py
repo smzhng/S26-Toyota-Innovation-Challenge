@@ -54,6 +54,9 @@ class ClientSession:
     awaiting_path_complete: bool = False
     # Planned path cells for GUI overlay
     planned_path_cells: list[tuple[int, int]] = field(default_factory=list)
+    # Task tracking for dashboard display
+    task_destination: Optional[dict] = None     # {"x_cm": float, "y_cm": float}
+    task_total_waypoints: int = 0
 
 
 clients_lock = threading.Lock()
@@ -171,6 +174,8 @@ def clear_robot_sequence(session: ClientSession) -> None:
     session.awaiting_path_ack = False
     session.awaiting_path_complete = False
     session.planned_path_cells = []
+    session.task_destination = None
+    session.task_total_waypoints = 0
 
 
 # ----------------------------
@@ -455,6 +460,8 @@ def queue_robot_path(message: dict) -> bool:
         session.active_subpath_id = None
         session.awaiting_path_ack = False
         session.awaiting_path_complete = False
+        session.task_destination = waypoints[-1] if waypoints else None
+        session.task_total_waypoints = len(waypoints)
 
     maybe_dispatch_waiting_sequences()
     return True
@@ -711,6 +718,78 @@ def start_retrieval_mission(x_cm: float, y_cm: float) -> bool:
 
 
 # ----------------------------
+# Collision-aware single-robot routing
+# ----------------------------
+def handle_goto_with_avoidance(robot_id: str, x_cm: float, y_cm: float, motion: Optional[dict]) -> bool:
+    """
+    Route a single robot to (x_cm, y_cm) using space-time A*, reserving cells
+    occupied by all other connected robots so paths don't intersect.
+    Falls back gracefully if no telemetry is available.
+    """
+    goal = cm_to_cell(x_cm, y_cm)
+
+    with clients_lock:
+        cid = robots_by_id.get(robot_id)
+        session = client_sessions.get(cid) if cid else None
+        if session is None:
+            print(f"[GOTO] {robot_id} not connected")
+            return False
+        if not session.last_telemetry:
+            print(f"[GOTO] No telemetry for {robot_id} — cannot plan")
+            return False
+        start = pose_to_cell(session.last_telemetry)
+        if start is None:
+            return False
+
+        # Build reservations from other robots' planned paths or current positions
+        reservations: dict = {}
+        for other_id, other_cid in robots_by_id.items():
+            if other_id == robot_id:
+                continue
+            other_session = client_sessions.get(other_cid)
+            if other_session is None:
+                continue
+            if other_session.planned_path_cells:
+                reserve_path(other_session.planned_path_cells, other_id, reservations)
+            elif other_session.last_telemetry:
+                other_cell = pose_to_cell(other_session.last_telemetry)
+                if other_cell:
+                    for t in range(30):
+                        reservations[(other_cell[0], other_cell[1], t)] = other_id
+
+    path = plan_space_time_path(start=start, goal=goal, reservations=reservations, robot_id=robot_id)
+    if path is None:
+        print(f"[GOTO] No collision-free path for {robot_id} to cell {goal}")
+        return False
+
+    waypoints = [cell_center_waypoint(c) for c in path[1:]]
+    if not waypoints:
+        print(f"[GOTO] {robot_id} already at goal")
+        return True
+
+    with clients_lock:
+        cid = robots_by_id.get(robot_id)
+        session = client_sessions.get(cid) if cid else None
+        if session is None:
+            return False
+        clear_robot_sequence(session)
+        session.pending_waypoints = waypoints
+        session.planned_path_cells = path
+        session.task_destination = {"x_cm": x_cm, "y_cm": y_cm}
+        session.task_total_waypoints = len(waypoints)
+        session.sequence_path_id = next_subpath_id()
+        session.active_subpath_id = None
+        session.awaiting_path_ack = False
+        session.awaiting_path_complete = False
+        if isinstance(motion, dict):
+            session.pending_motion = motion
+
+    print(f"[GOTO] {robot_id}: {start}→{goal}, {len(path)-1} steps (collision-aware)")
+    maybe_dispatch_waiting_sequences()
+    return True
+
+
+# ----------------------------
 # GUI command callback
 # ----------------------------
 def gui_command_sender(message_obj) -> None:
@@ -721,6 +800,16 @@ def gui_command_sender(message_obj) -> None:
         if message.get("type") == "coordinated_traverse":
             ok = start_coordinated_traverse(message)
             print("[GUI SEND] Coordinated traverse", "started" if ok else "FAILED")
+            return
+
+        if message.get("type") == "goto_with_avoidance":
+            ok = handle_goto_with_avoidance(
+                robot_id or "",
+                float(message.get("x_cm", 0)),
+                float(message.get("y_cm", 0)),
+                message.get("motion"),
+            )
+            print("[GUI SEND] goto_with_avoidance", "ok" if ok else "FAILED")
             return
 
         if message.get("type") == "retrieval_mission":
@@ -811,8 +900,15 @@ def handle_telemetry(client_id: int, msg: dict) -> None:
     with clients_lock:
         session = client_sessions[client_id]
         session.last_telemetry = msg
+        task_dest = session.task_destination
+        wpts_remaining = len(session.pending_waypoints)
+        task_total = session.task_total_waypoints
     if session.robot_id:
-        gui.update_robot(session.robot_id, msg)
+        enriched = dict(msg)
+        enriched["task_destination"] = task_dest
+        enriched["waypoints_remaining"] = wpts_remaining
+        enriched["task_total_waypoints"] = task_total
+        gui.update_robot(session.robot_id, enriched)
     robot_label = session.robot_id or f"client_{client_id}"
     print(f"[{robot_label}] telemetry: {msg}")
 
@@ -853,6 +949,9 @@ def handle_path_event(client_id: int, msg: dict) -> None:
             session.current_path_id = None
             session.awaiting_path_complete = False
             session.active_subpath_id = None
+            if not session.pending_waypoints:
+                session.task_destination = None
+                session.task_total_waypoints = 0
 
         session.last_status = merged
 

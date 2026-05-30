@@ -180,15 +180,17 @@ class TelemetryGUI:
         robots_frame = ttk.LabelFrame(scrollable_frame, text="Robots")
         robots_frame.pack(fill=tk.X, expand=False, padx=(0, 8), pady=(0, 8))
 
-        columns = ("robot_id", "state", "x", "y", "theta")
+        columns = ("robot_id", "state", "x", "y", "theta", "dest", "wpts")
         self.tree = ttk.Treeview(robots_frame, columns=columns, show="headings", height=4)
         for col in columns:
             self.tree.heading(col, text=col)
-        self.tree.column("robot_id", width=80, anchor="center")
-        self.tree.column("state",    width=90, anchor="center")
-        self.tree.column("x",        width=50, anchor="center")
-        self.tree.column("y",        width=50, anchor="center")
-        self.tree.column("theta",    width=60, anchor="center")
+        self.tree.column("robot_id", width=70,  anchor="center")
+        self.tree.column("state",    width=80,  anchor="center")
+        self.tree.column("x",        width=45,  anchor="center")
+        self.tree.column("y",        width=45,  anchor="center")
+        self.tree.column("theta",    width=45,  anchor="center")
+        self.tree.column("dest",     width=90,  anchor="center")
+        self.tree.column("wpts",     width=40,  anchor="center")
         self.tree.pack(fill=tk.X, expand=False)
 
         # ── Arena plot ────────────────────────────────────────────────────
@@ -295,37 +297,42 @@ class TelemetryGUI:
             command=self._reset_mission,
         ).pack(fill=tk.X, padx=4, pady=(0, 6))
 
-        # ── Coordinated traverse panel ────────────────────────────────────
-        coord_frame = ttk.LabelFrame(scrollable_frame, text="Grid Coordination")
+        # ── Multi-Robot Navigate panel ────────────────────────────────────
+        coord_frame = ttk.LabelFrame(scrollable_frame, text="Multi-Robot Navigate")
         coord_frame.pack(fill=tk.X, expand=False, padx=(0, 8), pady=(8, 0))
 
         ttk.Label(coord_frame,
-                  text="40×40 grid at 10 cm resolution.",
-                  wraplength=280, justify=tk.LEFT).pack(fill=tk.X, pady=(4, 6))
+                  text="Routes both robots simultaneously using space-time A* — "
+                       "paths are collision-free by design.",
+                  wraplength=280, justify=tk.LEFT).pack(fill=tk.X, padx=4, pady=(4, 6))
 
-        for label, robot_var_name, row_var_name, col_var_name, row_default, col_default in [
-            ("Robot 1", "grid_robot_one_var", "grid_robot_one_row_var", "grid_robot_one_col_var", "10", "10"),
-            ("Robot 2", "grid_robot_two_var", "grid_robot_two_row_var", "grid_robot_two_col_var", "20", "20"),
+        self.grid_robot_one_var = tk.StringVar(value="")
+        self.grid_robot_two_var = tk.StringVar(value="")
+
+        for label, robot_var, combo_attr, x_attr, y_attr, x_def, y_def in [
+            ("Robot 1", self.grid_robot_one_var, "multi_robot_one_combo",
+             "multi_robot_one_x_var", "multi_robot_one_y_var", "100", "100"),
+            ("Robot 2", self.grid_robot_two_var, "multi_robot_two_combo",
+             "multi_robot_two_x_var", "multi_robot_two_y_var", "200", "200"),
         ]:
-            ttk.Label(coord_frame, text=label).pack(fill=tk.X)
-            setattr(self, robot_var_name, tk.StringVar(value=""))
-            combo = ttk.Combobox(coord_frame, textvariable=getattr(self, robot_var_name),
-                                 state="readonly", values=[])
-            combo.pack(fill=tk.X, pady=(0, 4))
+            ttk.Label(coord_frame, text=label).pack(fill=tk.X, padx=4)
+            combo = ttk.Combobox(coord_frame, textvariable=robot_var, state="readonly", values=[])
+            combo.pack(fill=tk.X, padx=4, pady=(0, 4))
+            setattr(self, combo_attr, combo)
             goal_row = ttk.Frame(coord_frame)
-            goal_row.pack(fill=tk.X, pady=(0, 6))
-            ttk.Label(goal_row, text="Goal row").grid(row=0, column=0, sticky="w")
-            setattr(self, row_var_name, tk.StringVar(value=row_default))
-            ttk.Entry(goal_row, textvariable=getattr(self, row_var_name), width=6).grid(row=0, column=1, padx=(4, 12))
-            ttk.Label(goal_row, text="Goal col").grid(row=0, column=2, sticky="w")
-            setattr(self, col_var_name, tk.StringVar(value=col_default))
-            ttk.Entry(goal_row, textvariable=getattr(self, col_var_name), width=6).grid(row=0, column=3, padx=(4, 0))
+            goal_row.pack(fill=tk.X, padx=4, pady=(0, 6))
+            ttk.Label(goal_row, text="Target X (cm)").grid(row=0, column=0, sticky="w")
+            setattr(self, x_attr, tk.StringVar(value=x_def))
+            ttk.Entry(goal_row, textvariable=getattr(self, x_attr), width=6).grid(row=0, column=1, padx=(4, 12))
+            ttk.Label(goal_row, text="Y (cm)").grid(row=0, column=2, sticky="w")
+            setattr(self, y_attr, tk.StringVar(value=y_def))
+            ttk.Entry(goal_row, textvariable=getattr(self, y_attr), width=6).grid(row=0, column=3, padx=(4, 0))
 
-        self.grid_plan_summary_var = tk.StringVar(value="Select two robots and set destination cells (0–39).")
+        self.grid_plan_summary_var = tk.StringVar(value="Select two robots and set target positions.")
         ttk.Label(coord_frame, textvariable=self.grid_plan_summary_var,
-                  wraplength=280, justify=tk.LEFT).pack(fill=tk.X, pady=(0, 6))
-        ttk.Button(coord_frame, text="Start Two-Robot Traverse",
-                   command=self._send_two_robot_traverse).pack(fill=tk.X, pady=2)
+                  wraplength=280, justify=tk.LEFT).pack(fill=tk.X, padx=4, pady=(0, 6))
+        ttk.Button(coord_frame, text="Navigate Both Robots",
+                   command=self._send_two_robot_traverse).pack(fill=tk.X, padx=4, pady=(0, 6))
 
     # ----------------------------
     # Helpers
@@ -623,20 +630,26 @@ class TelemetryGUI:
     def _refresh_table(self):
         self.tree.delete(*self.tree.get_children())
         for robot_id, state in self.robot_states.items():
+            dest = state.get("task_destination")
+            dest_str = f"({dest['x_cm']:.0f},{dest['y_cm']:.0f})" if dest else "—"
+            wpts = state.get("waypoints_remaining", 0)
+            wpts_str = str(wpts) if wpts else "—"
             self.tree.insert("", "end", values=(
                 robot_id,
                 state.get("state", ""),
                 round(float(state.get("x_cm", 0.0)), 1),
                 round(float(state.get("y_cm", 0.0)), 1),
                 round(float(state.get("theta_deg", 0.0)), 1),
+                dest_str,
+                wpts_str,
             ))
 
     def _refresh_robot_selector(self):
         robot_ids = sorted(self.robot_states.keys())
         for combo_var, combo_name in [
-            (self.selected_robot_var,  "robot_selector"),
-            (self.grid_robot_one_var,  "grid_robot_one_selector"),
-            (self.grid_robot_two_var,  "grid_robot_two_selector"),
+            (self.selected_robot_var, "robot_selector"),
+            (self.grid_robot_one_var, "multi_robot_one_combo"),
+            (self.grid_robot_two_var, "multi_robot_two_combo"),
         ]:
             widget = getattr(self, combo_name, None)
             if widget:
@@ -650,11 +663,15 @@ class TelemetryGUI:
         selected_state = self.robot_states.get(self.selected_robot_var.get())
         if selected_state:
             robot_id = self.selected_robot_var.get()
+            dest = selected_state.get("task_destination")
+            wpts = selected_state.get("waypoints_remaining", 0)
+            dest_str = f" → ({dest['x_cm']:.0f},{dest['y_cm']:.0f}) [{wpts} left]" if dest else ""
             self.selected_robot_summary_var.set(
                 f"{robot_id}: {selected_state.get('state','?')}  "
                 f"({float(selected_state.get('x_cm',0)):.0f}, "
                 f"{float(selected_state.get('y_cm',0)):.0f}) cm  "
                 f"{float(selected_state.get('theta_deg',0)):.0f}°"
+                f"{dest_str}"
             )
         else:
             self.selected_robot_summary_var.set("Select a robot.")
@@ -781,14 +798,14 @@ class TelemetryGUI:
         self._mission_status_label.config(fg=MISSION_COLORS["idle"])
         self._target_coords_var.set("Target: not yet detected")
 
-    def _parse_goal_cell(self, row_var, col_var):
+    def _parse_goal_cm(self, x_var, y_var):
         try:
-            row = int(row_var.get())
-            col = int(col_var.get())
+            x = float(x_var.get())
+            y = float(y_var.get())
         except (TypeError, ValueError):
             return None
-        if not (0 <= row < self.GRID_DIM_CELLS and 0 <= col < self.GRID_DIM_CELLS):
-            return None
+        col = max(0, min(self.GRID_DIM_CELLS - 1, int(x / 10)))
+        row = max(0, min(self.GRID_DIM_CELLS - 1, int(y / 10)))
         return row, col
 
     def _send_two_robot_traverse(self):
@@ -799,16 +816,20 @@ class TelemetryGUI:
         if not r1 or not r2 or r1 == r2:
             self.grid_plan_summary_var.set("Pick two different robots.")
             return
-        g1 = self._parse_goal_cell(self.grid_robot_one_row_var, self.grid_robot_one_col_var)
-        g2 = self._parse_goal_cell(self.grid_robot_two_row_var, self.grid_robot_two_col_var)
+        g1 = self._parse_goal_cm(self.multi_robot_one_x_var, self.multi_robot_one_y_var)
+        g2 = self._parse_goal_cm(self.multi_robot_two_x_var, self.multi_robot_two_y_var)
         if g1 is None or g2 is None:
-            self.grid_plan_summary_var.set("Goal cells must be integers 0–39.")
+            self.grid_plan_summary_var.set("Enter valid X/Y coordinates (cm).")
             return
         if g1 == g2:
-            self.grid_plan_summary_var.set("Choose different goal cells.")
+            self.grid_plan_summary_var.set("Targets map to the same grid cell — choose farther apart positions.")
             return
+        x1 = float(self.multi_robot_one_x_var.get())
+        y1 = float(self.multi_robot_one_y_var.get())
+        x2 = float(self.multi_robot_two_x_var.get())
+        y2 = float(self.multi_robot_two_y_var.get())
         self.grid_plan_summary_var.set(
-            f"Planning: {r1}→({g1[0]},{g1[1]}), {r2}→({g2[0]},{g2[1]})"
+            f"Planning: {r1}→({x1:.0f},{y1:.0f}), {r2}→({x2:.0f},{y2:.0f})"
         )
         self.command_sender({
             "type": "coordinated_traverse",
@@ -829,13 +850,17 @@ class TelemetryGUI:
             return
         x_cm = min(max(x_cm, 0.0), 400.0)
         y_cm = min(max(y_cm, 0.0), 400.0)
-        self.command_sender(PathAssignmentMessage(
-            robot_id=rid,
-            path_id=self._next_test_path_id(),
-            replace_existing=True,
-            waypoints=[Waypoint(x_cm=x_cm, y_cm=y_cm)],
-            motion=self._get_motion_settings(),
-        ))
+        motion = self._get_motion_settings()
+        self.command_sender({
+            "type": "goto_with_avoidance",
+            "robot_id": rid,
+            "x_cm": x_cm,
+            "y_cm": y_cm,
+            "motion": {
+                "turn_speed_deg_per_sec": motion.turn_speed_deg_per_sec,
+                "drive_speed_deg_per_sec": motion.drive_speed_deg_per_sec,
+            },
+        })
 
     def _append_event_log(self, robot_id: str, event_type: str, msg: dict):
         import time as _time

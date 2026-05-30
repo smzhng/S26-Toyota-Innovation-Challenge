@@ -34,20 +34,18 @@ void setMotorsRight() {
 
 void closeGripper() {
   prizm.setServoPosition(1,35);
-  //delay(500);
 }
 
 void openGripper() {
-  prizm.setServoPosition(1,100);
-  //delay(500); 
-} 
+  prizm.setServoPosition(1,180);
+}
 
 void setup() {
   prizm.PrizmBegin();
   Serial.begin(9600);
   stopMotors();
 
-  prizm.setServoSpeed(1,50);  // set servo 1 speed to 50%
+  prizm.setServoSpeed(2,50);
 }
 
 void loop() {

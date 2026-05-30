@@ -101,6 +101,8 @@ class TelemetryGUI:
             "tab:purple", "tab:brown", "tab:pink", "tab:cyan",
         ])
 
+        self.event_log_queue = queue.Queue()
+
         self._build_layout()
         self.root.after(100, self._process_queue)
 
@@ -121,6 +123,10 @@ class TelemetryGUI:
             for row, col in path_cells
         ]
         self.telemetry_queue.put(("path_overlay", robot_id, waypoints))
+
+    def log_path_event(self, robot_id: str, event_type: str, msg: dict):
+        """Called by arbiter when a path lifecycle event arrives from a robot."""
+        self.event_log_queue.put((robot_id, event_type, dict(msg)))
 
     # ----------------------------
     # Layout
@@ -220,6 +226,46 @@ class TelemetryGUI:
             ("Send L Test Path",  self._send_test_path),
         ]:
             ttk.Button(controls_frame, text=label, command=cmd).pack(fill=tk.X, pady=2)
+
+        # ── Go To Coordinates panel ───────────────────────────────────────
+        goto_frame = ttk.LabelFrame(scrollable_frame, text="Go To Coordinates")
+        goto_frame.pack(fill=tk.X, expand=False, padx=(0, 8), pady=(8, 0))
+
+        ttk.Label(goto_frame,
+                  text="Send selected robot to an exact position.",
+                  wraplength=280, justify=tk.LEFT).pack(fill=tk.X, padx=4, pady=(4, 4))
+
+        goto_coord_row = ttk.Frame(goto_frame)
+        goto_coord_row.pack(fill=tk.X, padx=4, pady=(0, 4))
+        ttk.Label(goto_coord_row, text="X (cm)").grid(row=0, column=0, sticky="w")
+        self.goto_x_var = tk.StringVar(value="")
+        ttk.Entry(goto_coord_row, textvariable=self.goto_x_var, width=7).grid(row=0, column=1, padx=(4, 12))
+        ttk.Label(goto_coord_row, text="Y (cm)").grid(row=0, column=2, sticky="w")
+        self.goto_y_var = tk.StringVar(value="")
+        ttk.Entry(goto_coord_row, textvariable=self.goto_y_var, width=7).grid(row=0, column=3, padx=(4, 0))
+
+        ttk.Button(goto_frame, text="Send Robot to Coordinates",
+                   command=self._send_goto_waypoint).pack(fill=tk.X, padx=4, pady=(0, 6))
+
+        # ── Path Events log ───────────────────────────────────────────────
+        event_log_frame = ttk.LabelFrame(scrollable_frame, text="Path Events")
+        event_log_frame.pack(fill=tk.X, expand=False, padx=(0, 8), pady=(8, 0))
+
+        log_inner = ttk.Frame(event_log_frame)
+        log_inner.pack(fill=tk.X, expand=False)
+        self._event_log = tk.Text(log_inner, height=8, font=("Courier", 8),
+                                   wrap="word", state="disabled", bg="#1e1e1e", fg="#d4d4d4",
+                                   relief="flat")
+        log_scrollbar = ttk.Scrollbar(log_inner, command=self._event_log.yview)
+        self._event_log.configure(yscrollcommand=log_scrollbar.set)
+        self._event_log.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        log_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self._event_log.tag_configure("started",  foreground="#4ec9b0")
+        self._event_log.tag_configure("reached",  foreground="#dcdcaa")
+        self._event_log.tag_configure("complete", foreground="#4fc1ff")
+
+        ttk.Button(event_log_frame, text="Clear Log",
+                   command=self._clear_event_log).pack(fill=tk.X, padx=4, pady=(2, 4))
 
         # ── Retrieval mission panel ───────────────────────────────────────
         mission_ctrl_frame = ttk.LabelFrame(scrollable_frame, text="Retrieval Mission")
@@ -418,6 +464,11 @@ class TelemetryGUI:
                 self._prune_echo_history(hist, t_s)
 
             updated = True
+
+        # Event log updates (drain synchronously — no redraw needed)
+        while not self.event_log_queue.empty():
+            robot_id, event_type, msg = self.event_log_queue.get()
+            self._append_event_log(robot_id, event_type, msg)
 
         if updated:
             self._refresh_table()
@@ -766,6 +817,62 @@ class TelemetryGUI:
                 {"robot_id": r2, "goal_row": g2[0], "goal_col": g2[1]},
             ],
         })
+
+    def _send_goto_waypoint(self):
+        rid = self._get_selected_robot_id()
+        if not rid or not self.command_sender:
+            return
+        try:
+            x_cm = float(self.goto_x_var.get())
+            y_cm = float(self.goto_y_var.get())
+        except ValueError:
+            return
+        x_cm = min(max(x_cm, 0.0), 400.0)
+        y_cm = min(max(y_cm, 0.0), 400.0)
+        self.command_sender(PathAssignmentMessage(
+            robot_id=rid,
+            path_id=self._next_test_path_id(),
+            replace_existing=True,
+            waypoints=[Waypoint(x_cm=x_cm, y_cm=y_cm)],
+            motion=self._get_motion_settings(),
+        ))
+
+    def _append_event_log(self, robot_id: str, event_type: str, msg: dict):
+        import time as _time
+        ts = _time.strftime("%H:%M:%S")
+
+        if event_type == "path_started":
+            line = f"[{ts}] {robot_id}  PATH STARTED  path={msg.get('path_id', '?')}\n"
+            tag = "started"
+        elif event_type == "waypoint_reached":
+            x = msg.get("x_cm")
+            y = msg.get("y_cm")
+            idx = msg.get("waypoint_index", "?")
+            coord = f"({x:.1f}, {y:.1f})" if x is not None and y is not None else "?"
+            line = f"[{ts}] {robot_id}  WAYPOINT #{idx} reached  {coord}\n"
+            tag = "reached"
+        elif event_type == "path_complete":
+            x = msg.get("x_cm")
+            y = msg.get("y_cm")
+            coord = f"({x:.1f}, {y:.1f})" if x is not None and y is not None else "?"
+            line = f"[{ts}] {robot_id}  PATH COMPLETE  {coord}\n"
+            tag = "complete"
+        else:
+            line = f"[{ts}] {robot_id}  {event_type}\n"
+            tag = None
+
+        self._event_log.configure(state="normal")
+        if tag:
+            self._event_log.insert("end", line, tag)
+        else:
+            self._event_log.insert("end", line)
+        self._event_log.see("end")
+        self._event_log.configure(state="disabled")
+
+    def _clear_event_log(self):
+        self._event_log.configure(state="normal")
+        self._event_log.delete("1.0", "end")
+        self._event_log.configure(state="disabled")
 
     def run(self):
         self.root.mainloop()

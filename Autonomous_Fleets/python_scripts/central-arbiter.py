@@ -858,6 +858,7 @@ def handle_path_event(client_id: int, msg: dict) -> None:
 
     if session.robot_id:
         gui.update_robot(session.robot_id, merged)
+        gui.log_path_event(session.robot_id, event_type, msg)
 
     print(f"[{session.robot_id or f'client_{client_id}'}] {msg.get('type')}: {msg}")
 

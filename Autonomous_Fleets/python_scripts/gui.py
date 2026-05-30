@@ -149,7 +149,7 @@ class TelemetryGUI:
         mainframe.pack(fill=tk.BOTH, expand=True)
 
         # Left panel
-        left_panel = ttk.Frame(mainframe, width=320)
+        left_panel = ttk.Frame(mainframe, width=380)
         left_panel.pack(side=tk.LEFT, fill=tk.Y, expand=False)
         left_panel.pack_propagate(False)
 

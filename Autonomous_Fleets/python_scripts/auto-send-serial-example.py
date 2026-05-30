@@ -5,7 +5,7 @@ import termios
 import select
 import time
 
-ser = serial.Serial('/dev/tty.usbserial-AQ00YYW4', 9600)
+ser = serial.Serial('COM6', 9600)
 
 print("w=forward  s=backward  a=left  d=right")
 print("1=open gripper  2=close gripper")

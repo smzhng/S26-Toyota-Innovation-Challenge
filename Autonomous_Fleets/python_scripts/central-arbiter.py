@@ -1,11 +1,14 @@
 import json
 from collections import deque
 import heapq
+import math
 import socket
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional
+
+import numpy as np
 
 from gui import TelemetryGUI
 
@@ -27,6 +30,161 @@ HOME_Y_CM = 50.0
 
 # Seconds to wait after closing gripper before planning the return trip
 GRIPPER_CLOSE_DELAY_S = 1.5
+
+
+# ----------------------------
+# Occupancy Grid
+# ----------------------------
+# Each cell is a float in [0.0, 1.0]:
+#   0.0 = certainly free
+#   0.5 = unknown (initial state)
+#   1.0 = certainly occupied
+#
+# We use a log-odds update so repeated sensor hits accumulate confidence
+# and single noise hits don't instantly mark a cell as occupied.
+
+CELL_SIZE_CM = GRID_CELL_CM          # 10 cm per cell
+P_OCCUPIED_HIT  = 0.85               # probability obstacle is there given sensor hit
+P_OCCUPIED_FREE = 0.15               # probability obstacle is there given sensor ray passed through
+LOG_ODDS_MAX =  5.0                  # clamp to avoid overconfidence
+LOG_ODDS_MIN = -5.0
+MAX_ULTRASONIC_CM = 180.0            # ignore readings beyond this (sensor noise floor)
+MIN_ULTRASONIC_CM = 3.0
+
+
+def _log_odds(p: float) -> float:
+    return math.log(p / (1.0 - p))
+
+
+LOG_ODDS_HIT  = _log_odds(P_OCCUPIED_HIT)
+LOG_ODDS_FREE = _log_odds(P_OCCUPIED_FREE)
+LOG_ODDS_PRIOR = 0.0   # log-odds of p=0.5
+
+
+class OccupancyGrid:
+    """
+    40x40 log-odds occupancy grid updated from ultrasonic telemetry.
+    Thread-safe: all public methods acquire self._lock.
+    """
+
+    def __init__(self, dim: int = GRID_DIM_CELLS):
+        self.dim = dim
+        self._lock = threading.Lock()
+        # log-odds grid, initialised to 0 (unknown, p=0.5)
+        self._grid = np.zeros((dim, dim), dtype=np.float32)
+
+    def _cm_to_cell(self, x_cm: float, y_cm: float) -> tuple[int, int] | None:
+        col = int(x_cm / CELL_SIZE_CM)
+        row = int(y_cm / CELL_SIZE_CM)
+        if 0 <= row < self.dim and 0 <= col < self.dim:
+            return row, col
+        return None
+
+    def _bresenham(self, r0: int, c0: int, r1: int, c1: int) -> list[tuple[int, int]]:
+        """Return all grid cells on the line from (r0,c0) to (r1,c1)."""
+        cells = []
+        dr = abs(r1 - r0)
+        dc = abs(c1 - c0)
+        r, c = r0, c0
+        sr = 1 if r1 > r0 else -1
+        sc = 1 if c1 > c0 else -1
+        if dc > dr:
+            err = dc / 2
+            while c != c1:
+                cells.append((r, c))
+                err -= dr
+                if err < 0:
+                    r += sr
+                    err += dc
+                c += sc
+        else:
+            err = dr / 2
+            while r != r1:
+                cells.append((r, c))
+                err -= dc
+                if err < 0:
+                    c += sc
+                    err += dr
+                r += sr
+        cells.append((r1, c1))
+        return cells
+
+    def update(
+        self,
+        robot_x_cm: float,
+        robot_y_cm: float,
+        theta_deg: float,
+        sensor_dist_cm: float,
+        sensor_angle_offset_deg: float = 0.0,
+        sensor_forward_offset_cm: float = 0.0,
+        sensor_lateral_offset_cm: float = 0.0,
+    ) -> None:
+        """
+        Update grid from one ultrasonic reading.
+        - Cells along the ray up to the hit are marked free
+        - The cell at the hit is marked occupied
+        - Readings outside valid range are ignored
+        """
+        if not (MIN_ULTRASONIC_CM <= sensor_dist_cm <= MAX_ULTRASONIC_CM):
+            return
+
+        theta_rad = math.radians(theta_deg)
+
+        # Sensor world position
+        sx = robot_x_cm + sensor_forward_offset_cm * math.cos(theta_rad) \
+                        - sensor_lateral_offset_cm * math.sin(theta_rad)
+        sy = robot_y_cm + sensor_forward_offset_cm * math.sin(theta_rad) \
+                        + sensor_lateral_offset_cm * math.cos(theta_rad)
+
+        # Obstacle world position
+        ray_angle_rad = math.radians(theta_deg + sensor_angle_offset_deg)
+        ox = sx + sensor_dist_cm * math.cos(ray_angle_rad)
+        oy = sy + sensor_dist_cm * math.sin(ray_angle_rad)
+
+        start_cell = self._cm_to_cell(sx, sy)
+        end_cell   = self._cm_to_cell(ox, oy)
+
+        if start_cell is None:
+            return
+
+        with self._lock:
+            if end_cell is not None:
+                ray_cells = self._bresenham(start_cell[0], start_cell[1],
+                                            end_cell[0],   end_cell[1])
+                # All cells except the last are free
+                for cell in ray_cells[:-1]:
+                    r, c = cell
+                    self._grid[r, c] = max(LOG_ODDS_MIN,
+                                           self._grid[r, c] + LOG_ODDS_FREE)
+                # Last cell is the obstacle hit
+                r, c = ray_cells[-1]
+                self._grid[r, c] = min(LOG_ODDS_MAX,
+                                       self._grid[r, c] + LOG_ODDS_HIT)
+            else:
+                # Obstacle out of bounds — just mark ray cells as free
+                if start_cell:
+                    ray_cells = self._bresenham(
+                        start_cell[0], start_cell[1],
+                        max(0, min(self.dim-1, int(oy / CELL_SIZE_CM))),
+                        max(0, min(self.dim-1, int(ox / CELL_SIZE_CM))),
+                    )
+                    for cell in ray_cells:
+                        r, c = cell
+                        self._grid[r, c] = max(LOG_ODDS_MIN,
+                                               self._grid[r, c] + LOG_ODDS_FREE)
+
+    def get_probability_map(self) -> np.ndarray:
+        """Return a (dim x dim) array of occupation probabilities [0..1]."""
+        with self._lock:
+            return 1.0 / (1.0 + np.exp(-self._grid.copy()))
+
+    def reset(self) -> None:
+        with self._lock:
+            self._grid[:] = 0.0
+
+
+# Global occupancy grid — shared across all robot telemetry handlers
+occupancy_grid = OccupancyGrid()
 
 
 # ----------------------------
@@ -909,6 +1067,32 @@ def handle_telemetry(client_id: int, msg: dict) -> None:
         enriched["waypoints_remaining"] = wpts_remaining
         enriched["task_total_waypoints"] = task_total
         gui.update_robot(session.robot_id, enriched)
+
+    # Update occupancy grid from ultrasonic readings
+    x_cm  = msg.get("x_cm")
+    y_cm  = msg.get("y_cm")
+    theta = msg.get("theta_deg")
+    front = msg.get("front_ultrasonic_cm")
+    left  = msg.get("left_ultrasonic_cm")
+
+    if x_cm is not None and y_cm is not None and theta is not None:
+        if front is not None:
+            occupancy_grid.update(
+                float(x_cm), float(y_cm), float(theta),
+                float(front),
+                sensor_angle_offset_deg=0.0,
+                sensor_forward_offset_cm=9.5,
+                sensor_lateral_offset_cm=0.0,
+            )
+        if left is not None:
+            occupancy_grid.update(
+                float(x_cm), float(y_cm), float(theta),
+                float(left),
+                sensor_angle_offset_deg=90.0,
+                sensor_forward_offset_cm=0.0,
+                sensor_lateral_offset_cm=16.0,
+            )
+        gui.update_occupancy_map(occupancy_grid.get_probability_map())
     robot_label = session.robot_id or f"client_{client_id}"
     print(f"[{robot_label}] telemetry: {msg}")
 

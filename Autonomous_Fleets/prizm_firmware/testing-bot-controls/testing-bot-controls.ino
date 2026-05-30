@@ -38,6 +38,7 @@ void closeGripper() {
 
 void openGripper() {
   prizm.setServoPosition(1,180);
+  //delay(500);
 }
 
 void setup() {
